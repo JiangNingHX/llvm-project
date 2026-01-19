@@ -193,7 +193,7 @@ doPartitioning(Module &M, unsigned NumParts,
     // When a function has indirect calls, it must stay in the first partition
     // alongside every reachable non-entry function. This is a nightmare case
     // for splitting as it severely limits what we can do.
-    if (CurFn.HasIndirectCall) {
+    if (CurFn.HasAliasesCall) {
       {std::lock_guard<std::mutex> lock(mtx);
       LLVM_DEBUG(dbgs() << "Function with indirect call(s): " << CurFn.F->getName()
                         << " defaulting to P0\n");}
@@ -255,6 +255,15 @@ void SplitModuleCG::getLargeFunction() {
   }
 }
 
+void SplitModuleCG::getAliasFunction() {
+  for (GlobalAlias &GA : M.aliases()) {
+    const GlobalObject *GO = GA.getAliaseeObject();
+    if (const auto *Funcs = dyn_cast<Function>(GO)) {
+      AliasesFuncs.insert(Funcs);
+    }
+  }
+}
+
 void SplitModuleCG::calculateEntryFuncs() {
   // First, find all the entry functions with an in-degree of 0
   // (i.e., those that are not called by any function).
@@ -270,12 +279,7 @@ void SplitModuleCG::calculateEntryFuncs() {
     }
   }
 
-  Function *MainFunc = nullptr;
-  for (Function &F : M)
-    if (!F.isDeclaration() && StringRef(F.getName().lower()).starts_with("main"))
-      MainFunc = &F;
-
-  // Find all the functions that can be found through the entry functions.
+    // Find all the functions that can be found through the entry functions.
   while (!WorkList.empty()) {
     const auto &CurFn = *WorkList.pop_back_val();
     assert(!CurFn.isDeclaration());
@@ -284,13 +288,7 @@ void SplitModuleCG::calculateEntryFuncs() {
       if (!Callee || Callee->isDeclaration())
         continue;
 
-      if (&CurFn == MainFunc && EntryFuncs.find(Callee) == EntryFuncs.end()) {
-        EntryFuncs.insert(Callee);
-        externalize(Callee);
-        externalFunction[Callee] = true;
-      }
-
-      auto [It, Inserted] = FindedFuncs.insert(Callee);
+        auto [It, Inserted] = FindedFuncs.insert(Callee);
       if (Inserted)
         WorkList.push_back(Callee);
     }
@@ -325,17 +323,16 @@ void SplitModuleCG::calculateEntryFuncs() {
 
 void SplitModuleCG::UpdateFWDInfo(llvm::FunctionWithDependencies &FWD) {
   FWD.Dependencies.clear();
-  FWD.HasIndirectCall = false;
-  addAllDependencies(*SCG, *FWD.F, FWD.Dependencies, DependenciesForMain,
-                     externalFunction);
-  FWD.TotalCost = FuncsCosts.at(FWD.F);
-  if (aliasesFunction.count(FWD.F))
-    FWD.HasIndirectCall = true;
+  FWD.HasAliasesCall = false;
+  addAllDependencies(*SCG, *FWD.F, FWD.Dependencies, externalFunction);
+  FWD.TotalCost = FuncsCosts.lookup(FWD.F);
+  if (AliasesFuncs.count(FWD.F))
+    FWD.HasAliasesCall = true;
 
   for (const auto *Dep : FWD.Dependencies) {
-    FWD.TotalCost += FuncsCosts.at(Dep);
-    if (aliasesFunction.count(Dep))
-      FWD.HasIndirectCall = true;
+    FWD.TotalCost += FuncsCosts.lookup(Dep);
+    if (AliasesFuncs.count(Dep))
+      FWD.HasAliasesCall = true;
   }
 }
 
@@ -358,11 +355,11 @@ void SplitModuleCG::splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &Wo
 
     auto *CallNode = SCG->getOrInsertFunction(FWD.F);
     for (auto &CalleeNode : *SCG->at(FWD.F)) {
-      if (!CalleeNode->CheckCallDepth())
+      auto *Callee = CalleeNode->getFunction();
+      if (AliasesFuncs.count(Callee) || !CalleeNode->CheckCallDepth())
         continue;
 
       // split
-      auto *Callee = CalleeNode->getFunction();
       CallNode->removeCalledFunction(CalleeNode);
       externalize(Callee);
       externalFunction[Callee] = true;
@@ -373,8 +370,8 @@ void SplitModuleCG::splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &Wo
     for (auto *F : NewEntryFuncs) {
       if (EntryFuncs.find(F) != EntryFuncs.end())
         continue;
-      WorkList.emplace_back(*SCG, FuncsCosts, F, DependenciesForMain,
-                            aliasesFunction, externalFunction);
+      WorkList.emplace_back(*SCG, FuncsCosts, F, 
+                            AliasesFuncs, externalFunction);
       WorkList[WorkList.size() - 1].SplitedLayer = SplitedLayer + 1;
       NewWorkList.push_back(WorkList.size() - 1);
     }
@@ -409,18 +406,10 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
       externalize(&GV);
   }
 
-  for (GlobalAlias &GA : M.aliases())
-  {
-    const GlobalObject *GO = GA.getAliaseeObject();
-    if (const auto *Funcs = dyn_cast<Function>(GO)) {
-      aliasesFunction.insert(Funcs);
-    }
-  }
-
   SmallVector<FunctionWithDependencies> WorkList;
   for (auto *F : EntryFuncs) {
-    WorkList.emplace_back(*SCG, FuncsCosts, F, DependenciesForMain,
-                          aliasesFunction, externalFunction);
+    WorkList.emplace_back(*SCG, FuncsCosts, F, 
+                          AliasesFuncs, externalFunction);
   }
 
   if (enableSplitCallGraph)
@@ -456,8 +445,9 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
     std::lock_guard<std::mutex> lock(mtx);
     LLVM_DEBUG(dbgs() << "result: \n");
     for (auto FWD : WorkList) {
-      LLVM_DEBUG(dbgs() << "[root] " << FWD.F->getName() << " (totalCost:" << FWD.TotalCost
-                        << " indirect:" << FWD.HasIndirectCall
+      LLVM_DEBUG(dbgs() << "[root] " << FWD.F->getName()
+                        << " (totalCost:" << FWD.TotalCost
+                        << " indirect:" << FWD.HasAliasesCall
                         << ")\n");
       for (auto * F : FWD.Dependencies) {
         LLVM_DEBUG(dbgs() << " [dependency] " << F->getName() << " "
@@ -518,9 +508,7 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
                         << NewName << "\n");
     }
   };
-  for (const auto &F : *MPart)
-    checkPromoted(F);
-  for (const auto &GV : MPart->globals())
+  for (const auto &GV : MPart->global_values())
     checkPromoted(GV);
 
     // Clean-up conservatively imported GVs without any users.
@@ -549,15 +537,14 @@ SplitModuleCG::SplitModuleCG(Module &M, unsigned LimitPartition)
     if (!GV.hasLocalLinkage())
       OriginalExternals.insert(GV.getName());
   };
-  for (const auto &F : M)
-    recordIfExternal(F);
-  for (const auto &GV : M.globals())
+  for (const auto &GV : M.global_values())
     recordIfExternal(GV);
   calculateFunctionCosts();
+  getAliasFunction();
   if (SplitCGFunctionSizeThreshold != 0)
     getLargeFunction();
 
-  SCG = std::make_unique<SimplifyCallGraph>(CG, LargeFuncs);
+  SCG = std::make_unique<SimplifyCallGraph>(CG, LargeFuncs, AliasesFuncs);
   calculateEntryFuncs();
   if (N == 0 || N > EntryFuncs.size()) {
     N = EntryFuncs.size();
@@ -575,8 +562,19 @@ void SimplifyCallGraph::createSimplifyCallGraph() {
     SimplifyCallGraphNode *SCGNode = getOrInsertFunction(F);
     for (const auto &CGNodeItem : *CGNode) {
       Function *Called = CGNodeItem.second->getFunction();
+      if (!Called) {
+        // deal with alias
+        auto *CallInst = cast<CallBase>(*CGNodeItem.first);
+        if (CallInst) {
+          llvm::Value *CalledVal = CallInst->getCalledOperand();
+          if (llvm::isa<llvm::GlobalAlias>(CalledVal)) {
+            AliasesFuncs.insert(F);
+          }
+        }
+      }
       if (!Called || Called->isDeclaration() ||
-          LargeFuncs.find(Called) != LargeFuncs.end())
+          (LargeFuncs.find(Called) != LargeFuncs.end() &&
+           !AliasesFuncs.count(Called)))
         continue;
       SCGNode->addCalledFunction(getOrInsertFunction(Called));
     }

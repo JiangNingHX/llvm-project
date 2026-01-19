@@ -24,8 +24,9 @@ class SimplifyCallGraph {
 
 public:
   explicit SimplifyCallGraph (CallGraph &CG,
-                              DenseSet<const Function *> &LargeFuncs)
-         : CG(CG), LargeFuncs(LargeFuncs) {
+                              DenseSet<const Function *> &LargeFuncs,
+                              DenseSet<const Function *> &AliasesFuncs)
+         : CG(CG), LargeFuncs(LargeFuncs), AliasesFuncs(AliasesFuncs) {
     createSimplifyCallGraph();
   }
   ~SimplifyCallGraph() {};
@@ -73,7 +74,8 @@ public:
 
 private:
   CallGraph &CG;
-  DenseSet<const Function *> LargeFuncs;
+  DenseSet<const Function *> &LargeFuncs;
+  DenseSet<const Function *> &AliasesFuncs;
 };
 
 class SimplifyCallGraphNode {
@@ -137,16 +139,11 @@ private:
 /// \param CG Call graph for \p F's module.
 /// \param F Current function to look at.
 /// \param Fns[out] Resulting list of functions.
-/// \param DependenciesForMain Dependencies functions for main.
 static void addAllDependencies(SimplifyCallGraph &SCG, const Function &F,
                                DenseSet<const Function *> &Fns,
-                               DenseSet<const Function *> &DependenciesForMain,
                                DenseMap<const Function *, bool> &externalFunction) {
   assert(!F.isDeclaration());
 
-  if (StringRef(F.getName().lower()).starts_with("main")) {
-    return;
-  }
   SmallVector<const Function *> WorkList({&F});
 
   while (!WorkList.empty()) {
@@ -173,26 +170,25 @@ struct FunctionWithDependencies {
   FunctionWithDependencies(SimplifyCallGraph &SCG,
                            const DenseMap<const Function *, CostType> &FnCosts,
                            const Function *F,
-                           DenseSet<const Function *> &DependenciesForMain,
-                           const DenseSet<const Function *> &aliasesFunction,
+                           const DenseSet<const Function *> &AliasesFuncs,
                            DenseMap<const Function *, bool> &externalFunction)
       : F(F) {
-    addAllDependencies(SCG, *F, Dependencies, DependenciesForMain, externalFunction);
-    if (aliasesFunction.count(F))
-      HasIndirectCall = true;
+    addAllDependencies(SCG, *F, Dependencies, externalFunction);
+    if (AliasesFuncs.count(F))
+      HasAliasesCall = true;
 
     TotalCost = FnCosts.at(F);
     for (const auto *Dep : Dependencies) {
-      TotalCost += FnCosts.at(Dep);
-      if (aliasesFunction.count(Dep))
-        HasIndirectCall = true;
+      TotalCost += FnCosts.lookup(Dep);
+      if (AliasesFuncs.count(Dep))
+        HasAliasesCall = true;
     }
   }
 
   const Function *F = nullptr;
   DenseSet<const Function *> Dependencies;
   /// Whether \p F or any of its \ref Dependencies contains an indirect call.
-  bool HasIndirectCall = false;
+  bool HasAliasesCall = false;
 
   CostType TotalCost = 0;
   int SplitedLayer = 0;
@@ -227,7 +223,7 @@ private:
   DenseSet<const Function *> EntryFuncs;
   DenseSet<const Function *> LargeFuncs;
   DenseSet<const Function *> DependenciesForMain;
-  DenseSet<const Function *> aliasesFunction;
+  DenseSet<const Function *> AliasesFuncs;
   StringSet<> OriginalExternals;
   StringMap<std::string> PromotedRenames;
   DenseMap<const Function *, bool> externalFunction;
@@ -236,6 +232,7 @@ private:
   void calculateEntryFuncs();
   void calculateFunctionCosts();
   void getLargeFunction();
+  void getAliasFunction();
   void splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &WorkList);
   void UpdateFWDInfo(llvm::FunctionWithDependencies &FWD);
   bool shouldCloneFunction(const Function *Fn);
