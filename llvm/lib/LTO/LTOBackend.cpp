@@ -17,6 +17,7 @@
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/ModuleSummaryAnalysis.h"
+#include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -44,6 +45,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/SubtargetFeature.h"
+#include "llvm/Transforms/IPO/SampleProfile.h"
 #include "llvm/Transforms/IPO/WholeProgramDevirt.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Utils/FunctionImportUtils.h"
@@ -264,6 +266,56 @@ createTargetMachine(const Config &Conf, const Target *TheTarget, Module &M) {
     TM->setLargeDataThreshold(*LargeDataThreshold);
 
   return TM;
+}
+
+static void runProfileLoaderPass(const Config &Conf, Module &Mod,
+		                 TargetMachine *TM) {
+  auto FS = vfs::getRealFileSystem();
+  std::optional<PGOOptions> PGOOpt;
+  if (!Conf.SampleProfile.empty())
+    PGOOpt = PGOOptions(Conf.SampleProfile, "", Conf.ProfileRemapping,
+                        /*MemoryProfile=*/"", FS, PGOOptions::SampleUse,
+                        PGOOptions::NoCSAction, true);
+  else if (Conf.RunCSIRInstr) {
+    PGOOpt = PGOOptions("", Conf.CSIRProfile, Conf.ProfileRemapping,
+                        /*MemoryProfile=*/"", FS, PGOOptions::IRUse,
+                        PGOOptions::CSIRInstr, Conf.AddFSDiscriminator);
+  } else if (!Conf.CSIRProfile.empty()) {
+    PGOOpt = PGOOptions(Conf.CSIRProfile, "", Conf.ProfileRemapping,
+                        /*MemoryProfile=*/"", FS, PGOOptions::IRUse,
+                        PGOOptions::CSIRUse, Conf.AddFSDiscriminator);
+    NoPGOWarnMismatch = !Conf.PGOWarnMismatch;
+  } else if (Conf.AddFSDiscriminator) {
+    PGOOpt = PGOOptions("", "", "", /*MemoryProfile=*/"", nullptr,
+                        PGOOptions::NoAction, PGOOptions::NoCSAction, true);
+  }
+  bool HasSampleProfile = PGOOpt && (PGOOpt->Action == PGOOptions::SampleUse);
+  if (!HasSampleProfile)
+    return;
+
+  LoopAnalysisManager LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+  PassInstrumentationCallbacks PIC;
+
+  PassBuilder PB(TM, Conf.PTO, PGOOpt, &PIC);
+
+  RegisterPassPlugins(Conf.PassPlugins, PB);
+
+  // Register all the basic analyses with the managers.
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  
+  ModulePassManager MPM;
+  MPM.addPass(SampleProfileLoaderPass(PGOOpt->ProfileFile,
+			              PGOOpt->ProfileRemappingFile,
+				      ThinOrFullLTOPhase::ThinLTOPostLink));
+  MPM.addPass(RequireAnalysisPass<ProfileSummaryAnalysis, Module>());
+  MPM.run(Mod, MAM);
 }
 
 static void runNewPMPasses(const Config &Conf, Module &Mod, TargetMachine *TM,
@@ -992,6 +1044,9 @@ Error lto::thinBackend(const Config &Conf, unsigned Task, AddStreamFn AddStream,
   // Set the partial sample profile ratio in the profile summary module flag of
   // the module, if applicable.
   Mod.setPartialSampleProfileRatio(CombinedIndex);
+
+  if (ThinLTOSplit)
+    runProfileLoaderPass(Conf, Mod, TM.get());
 
   if (Conf.CodeGenOnly) {
     if (ThinLTOSplit)
