@@ -171,25 +171,33 @@ struct FunctionWithDependencies {
                            const DenseMap<const Function *, CostType> &FnCosts,
                            const Function *F,
                            const DenseSet<const Function *> &AliasesFuncs,
-                           DenseMap<const Function *, bool> &externalFunction)
+                           DenseMap<const Function *, bool> &externalFunction,
+			   const DenseSet<const Function *> &IfuncFuncs)
       : F(F) {
     addAllDependencies(SCG, *F, Dependencies, externalFunction);
     if (AliasesFuncs.count(F))
       HasAliasesCall = true;
+    // If the function is an ifunc resolver, it must stay in the first partition.
+    if (IfuncFuncs.count(F))
+      isIfuncResolver = true;
 
     TotalCost = FnCosts.at(F);
     for (const auto *Dep : Dependencies) {
       TotalCost += FnCosts.lookup(Dep);
       if (AliasesFuncs.count(Dep))
         HasAliasesCall = true;
+      if (IfuncFuncs.count(Dep))
+        isIfuncResolver = true;
     }
   }
+
 
   const Function *F = nullptr;
   DenseSet<const Function *> Dependencies;
   /// Whether \p F or any of its \ref Dependencies contains an indirect call.
   bool HasAliasesCall = false;
-
+  bool isIfuncResolver = false;
+  
   CostType TotalCost = 0;
   int SplitedLayer = 0;
 
@@ -224,6 +232,7 @@ private:
   DenseSet<const Function *> LargeFuncs;
   DenseSet<const Function *> DependenciesForMain;
   DenseSet<const Function *> AliasesFuncs;
+  DenseSet<const Function *> IfuncFuncs;
   StringSet<> OriginalExternals;
   StringMap<std::string> PromotedRenames;
   DenseMap<const Function *, bool> externalFunction;
@@ -233,6 +242,7 @@ private:
   void calculateFunctionCosts();
   void getLargeFunction();
   void getAliasFunction();
+  void getIfuncFunction();
   void splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &WorkList);
   void UpdateFWDInfo(llvm::FunctionWithDependencies &FWD);
   bool shouldCloneFunction(const Function *Fn);

@@ -201,6 +201,17 @@ doPartitioning(Module &M, unsigned NumParts,
       continue;
     }
 
+    // If the function is an ifunc, it must stay in the first partition.
+    if (CurFn.isIfuncResolver) {
+      {std::lock_guard<std::mutex> lock(mtx);
+      LLVM_DEBUG(dbgs() << "Function with ifunc call(s): " << CurFn.F->getName()
+                        << " defaulting to P0\n");}
+      for (int part_i = 0; part_i < NumParts; ++part_i) {
+        AssignToPartition(part_i, CurFn);
+      }
+      continue;
+    }
+
     // Be smart with large functions to avoid duplicating their dependencies.
     if (CurFn.isLarge(LargeFnThreshold)) {
       assert(LargeFnOverlapForMerge >= 0.0f && LargeFnOverlapForMerge <= 1.0f);
@@ -263,6 +274,16 @@ void SplitModuleCG::getAliasFunction() {
     }
   }
 }
+
+void SplitModuleCG::getIfuncFunction() {
+  for (GlobalIFunc &GA : M.ifuncs()) {
+    const GlobalObject *GO = GA.getResolverFunction();
+    if (const auto *Funcs = dyn_cast<Function>(GO)) {
+      IfuncFuncs.insert(Funcs);
+    }
+  }
+}
+
 
 void SplitModuleCG::calculateEntryFuncs() {
   // First, find all the entry functions with an in-degree of 0
@@ -371,7 +392,7 @@ void SplitModuleCG::splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &Wo
       if (EntryFuncs.find(F) != EntryFuncs.end())
         continue;
       WorkList.emplace_back(*SCG, FuncsCosts, F, 
-                            AliasesFuncs, externalFunction);
+                            AliasesFuncs, externalFunction, IfuncFuncs);
       WorkList[WorkList.size() - 1].SplitedLayer = SplitedLayer + 1;
       NewWorkList.push_back(WorkList.size() - 1);
     }
@@ -381,16 +402,24 @@ void SplitModuleCG::splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &Wo
 }
 
 bool SplitModuleCG::shouldCloneFunction(const Function *Fn) {
+  if (IfuncFuncs.count(Fn)){
+    Function * F_tmp = const_cast<Function *>(Fn);
+    F_tmp->setLinkage(GlobalValue::InternalLinkage);
+    return true;
+  }
   if (externalFunction.count(Fn)) {
     if (!externalFunction[Fn]) {
-      return false;
+      return true;
     } else {
-      externalFunction[Fn] = false;
+      //externalFunction[Fn] = false;
       return true;
     }
   }
   return true;
 }
+
+using Clock = std::chrono::high_resolution_clock;
+using Ms = std::chrono::milliseconds;
 
 void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback ModuleCallback,
     bool PreserveLocals) {
@@ -405,11 +434,12 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
     for (GlobalVariable &GV : M.globals())
       externalize(&GV);
   }
+  getIfuncFunction();
 
   SmallVector<FunctionWithDependencies> WorkList;
   for (auto *F : EntryFuncs) {
     WorkList.emplace_back(*SCG, FuncsCosts, F, 
-                          AliasesFuncs, externalFunction);
+                          AliasesFuncs, externalFunction, IfuncFuncs);
   }
 
   if (enableSplitCallGraph)
@@ -448,17 +478,18 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
       LLVM_DEBUG(dbgs() << "[root] " << FWD.F->getName()
                         << " (totalCost:" << FWD.TotalCost
                         << " indirect:" << FWD.HasAliasesCall
+			<< "Fun cost: " << FuncsCosts[FWD.F]
                         << ")\n");
       for (auto * F : FWD.Dependencies) {
         LLVM_DEBUG(dbgs() << " [dependency] " << F->getName() << " "
-                          << externalFunction.count(F) << "\n");
+                          << externalFunction.count(F)<< " "<< FuncsCosts[F] << "\n");
       }
     }
-    LLVM_DEBUG(dbgs() << " [externalFunctions] : " << "\n");
-    for (auto it : externalFunction) {
-      LLVM_DEBUG(dbgs() << "                   " << it.first->getName()
-                        << " " << it.second << "\n");
-    }
+    // LLVM_DEBUG(dbgs() << " [externalFunctions] : " << "\n");
+    // for (auto it : externalFunction) {
+    //  LLVM_DEBUG(dbgs() << "                   " << it.first->getName()
+    //                    << " " << it.second << "\n");
+    //}
   }
 
   auto Partitions = doPartitioning(M, N, ModuleCost, FuncsCosts, WorkList, EntryFuncs);
@@ -473,9 +504,10 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
     const auto *Var = dyn_cast<GlobalVariable>(GV);
     return Var && Var->hasLocalLinkage();
   };
-
+ 
   unsigned TotalFnImpls = 0;
   for (unsigned I = 0; I < N; ++I) {
+    auto TimeStart = Clock::now();
     const auto &FnsInPart = Partitions[I];
 
     ValueToValueMapTy VMap;
@@ -504,8 +536,8 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
       std::string NewName =
           GV.getName().str() + "_" + M.getModuleIdentifier();
       PromotedRenames[GV.getName()] = NewName;
-      LLVM_DEBUG(dbgs() << "Promoted Symbol: " << GV.getName() << " -> "
-                        << NewName << "\n");
+      //LLVM_DEBUG(dbgs() << "Promoted Symbol: " << GV.getName() << " -> "
+        //                << NewName << "\n");
     }
   };
   for (const auto &GV : MPart->global_values())
@@ -517,15 +549,31 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
         GV.eraseFromParent();
     }
 
+    for (auto &func : MPart->functions()) {
+      auto Fn = M.getFunction(func.getName());
+      std::lock_guard<std::mutex> lock(mtx);
+      if (externalFunction.count(Fn) && !func.isDeclaration()) {
+        if (!externalFunction[Fn]) {
+          func.setLinkage(GlobalValue::WeakODRLinkage);
+        } else {
+          externalFunction[Fn] = false;
+        }
+      }
+    }
     {
       std::lock_guard<std::mutex> lock(mtx);
       LLVM_DEBUG(dbgs() << MPart->getModuleIdentifier() << "  : \n");
       for (auto &F : *MPart) {
         if (!F.isDeclaration())
-          LLVM_DEBUG(dbgs() << "[Function: ] " << F.getName() << "\n");
+          LLVM_DEBUG(dbgs() << "   [Function: ] " << F.getName() << " " << F.getLinkage() << "\n");
       }
     }
-
+   auto TimeEnd = Clock::now();
+    auto Elapsed = std::chrono::duration_cast<Ms>(TimeEnd - TimeStart);
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      LLVM_DEBUG(dbgs() << "partition "<< I  << "  : " << Elapsed.count() << " ms\n");
+    }
     ModuleCallback(std::move(MPart));
   }
 }
