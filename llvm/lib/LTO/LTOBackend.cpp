@@ -568,6 +568,39 @@ static bool canDoSplitModule(const llvm::Module &M) {
 
 using Clock = std::chrono::high_resolution_clock;
 using Ms = std::chrono::milliseconds;
+struct TaskIdAllocator {
+  using TaskId = unsigned;
+
+  // Use the most significant bit (MSB) as a namespace tag.
+  // - Original ThinLTO backend tasks are expected to have MSB == 0.
+  // - Split partitions allocated by this allocator always have MSB == 1.
+  // This guarantees the two ID spaces never overlap.
+  static constexpr TaskId tag() {
+    return TaskId{1} << (std::numeric_limits<TaskId>::digits - 1);
+  }
+
+  // Monotonic sequence counter for split partitions (MSB must remain 0 here).
+  std::atomic<TaskId> seq{0};
+
+  // Allocate a globally unique TaskId for a split partition.
+  // The returned ID is `tag() | seq`, so it lives in the MSB==1 namespace.
+  TaskId alloc() {
+    TaskId v = seq.fetch_add(1, std::memory_order_relaxed);
+
+    // If the counter ever reaches the MSB, we'd overlap namespaces.
+    // This indicates an overflow / too many partitions.
+    if (v & tag())
+      report_fatal_error("Partition TaskId overflow: seq reached the tag bit.");
+
+    return tag() | v;
+  }
+
+  // Helper for sanity checks / debugging.
+  static bool isPartition(TaskId id) { return (id & tag()) != 0; }
+};
+
+// Global allocator shared by all split partitions.
+static TaskIdAllocator gSplitTaskIds;
 
 static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine *TM,
                                    AddStreamFn AddStream,
@@ -618,9 +651,14 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
 
         unsigned CurrentThreadId = ThreadCount++;
 
+        assert(!TaskIdAllocator::isPartition(task) &&
+               "Original ThinLTO TaskId unexpectedly overlaps the partition namespace");
+        unsigned UniqueTaskId = gSplitTaskIds.alloc();
+
+
         // Enqueue the task
         PartitionThreadPool->async(
-            [&, CurrentThreadId](const SmallString<0> &BC) {
+            [&, CurrentThreadId, UniqueTaskId](const SmallString<0> &BC) {
               LTOLLVMContext Ctx(C);
               Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(
                   MemoryBufferRef(BC.str(), "ld-temp.o"),
@@ -634,7 +672,7 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
 
               if (DoOpt) {
                 auto StartOpt = Clock::now();
-                if (!opt(C, ThreadTM.get(), CurrentThreadId, *MPartInCtx, /*IsThinLTO=*/true,
+                if (!opt(C, ThreadTM.get(), UniqueTaskId, *MPartInCtx, /*IsThinLTO=*/true,
                          /*ExportSummary=*/nullptr, /*ImportSummary=*/&CombinedIndex,
                          CmdArgs)) {
                   report_fatal_error("Failed to gen opt for split mod in thread.");
@@ -693,7 +731,7 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
                     };
 
               auto StartCG = Clock::now();
-              codegen(C, ThreadTM.get(), splitStream, CurrentThreadId, *MPartInCtx,
+              codegen(C, ThreadTM.get(), splitStream, UniqueTaskId, *MPartInCtx,
                       CombinedIndex);
               auto EndCG = Clock::now();
               if (ThinLTODebugMpart) {
