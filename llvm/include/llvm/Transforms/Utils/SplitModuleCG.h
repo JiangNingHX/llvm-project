@@ -6,6 +6,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Analysis/CallGraph.h"
 #include "llvm/Support/InstructionCost.h"
+#include "llvm/Support/ThreadPool.h"
 #include <memory>
 
 namespace llvm {
@@ -214,7 +215,7 @@ class SplitModuleCG {
 public:
   using ModuleCreationCallback =
       function_ref<void(std::unique_ptr<Module> MPart)>;
-  SplitModuleCG(Module &M, unsigned LimitPartition = 0);
+  SplitModuleCG(Module &M, unsigned LimitPartition = 0, ThreadPool *PartitionThreadPool = nullptr);
   void SplitModule(TargetMachine *TM, ModuleCreationCallback ModuleCallback,
       bool PreserveLocals);
 
@@ -237,6 +238,7 @@ private:
   StringMap<std::string> PromotedRenames;
   DenseMap<const Function *, bool> externalFunction;
   DenseMap<const Function *, CostType> FuncsCosts;
+  ThreadPool *PartitionThreadPool;
 
   void calculateEntryFuncs();
   void calculateFunctionCosts();

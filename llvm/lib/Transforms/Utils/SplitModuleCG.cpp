@@ -513,51 +513,56 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
   };
  
   unsigned TotalFnImpls = 0;
+  std::vector<std::unique_ptr<Module>> MParts(N);
   for (unsigned I = 0; I < N; ++I) {
     auto TimeStart = Clock::now();
-    const auto &FnsInPart = Partitions[I];
+    PartitionThreadPool->async([&, I]() {
+      const auto &FnsInPart = Partitions[I];
 
-    ValueToValueMapTy VMap;
-    std::unique_ptr<Module> MPart(
-        CloneModule(M, VMap, [&](const GlobalValue *GV) {
-          // Functions go in their assigned partition.
-          if (const auto *Fn = dyn_cast<Function>(GV)) {
-            if (!FnsInPart.contains(Fn))
-              return false;
-            return shouldCloneFunction(Fn);
-          }
+      ValueToValueMapTy VMap;
+      std::unique_ptr<Module> MPart(
+          CloneModule(M, VMap, [&](const GlobalValue *GV) {
+            // Functions go in their assigned partition.
+            if (const auto *Fn = dyn_cast<Function>(GV)) {
+              if (!FnsInPart.contains(Fn))
+                return false;
+              return shouldCloneFunction(Fn);
+            }
 
-          if (NeedsConservativeImport(GV))
-            return true;
+            if (NeedsConservativeImport(GV))
+              return true;
 
-          // Everything else goes in the first partition.
-          return I == 0;
-        }));
+            // Everything else goes in the first partition.
+            return I == 0;
+          }));
+      MParts[I] = std::move(MPart);
+    });
+    PartitionThreadPool->wait();
 
-  // collect symbols to rename
-  auto checkPromoted = [&](const GlobalValue &GV) {
-    // now is external (not local), but not in external set.
-    if (!GV.hasLocalLinkage() && !OriginalExternals.contains(GV.getName())) {
-      if (PromotedRenames.count(GV.getName()))
-        return;
-      std::string NewName =
-          GV.getName().str() + "_" + M.getModuleIdentifier();
-      PromotedRenames[GV.getName()] = NewName;
-      //LLVM_DEBUG(dbgs() << "Promoted Symbol: " << GV.getName() << " -> "
-        //                << NewName << "\n");
-    }
-  };
-  for (const auto &GV : MPart->global_values())
-    checkPromoted(GV);
+    // collect symbols to rename
+    auto checkPromoted = [&](const GlobalValue &GV) {
+      // now is external (not local), but not in external set.
+      if (!GV.hasLocalLinkage() && !OriginalExternals.contains(GV.getName())) {
+        if (PromotedRenames.count(GV.getName()))
+          return;
+        std::string NewName =
+            GV.getName().str() + "_" + M.getModuleIdentifier();
+        PromotedRenames[GV.getName()] = NewName;
+        //LLVM_DEBUG(dbgs() << "Promoted Symbol: " << GV.getName() << " -> "
+          //                << NewName << "\n");
+      }
+    };
+    for (const auto &GV : MParts[I]->global_values())
+      checkPromoted(GV);
 
     // Clean-up conservatively imported GVs without any users.
-    for (auto &GV : make_early_inc_range(MPart->globals())) {
+    for (auto &GV : make_early_inc_range(MParts[I]->globals())) {
       if (NeedsConservativeImport(&GV) && GV.use_empty())
         GV.eraseFromParent();
     }
 
     if (EnableExternalClone) {
-      for (auto &func : MPart->functions()) {
+      for (auto &func : MParts[I]->functions()) {
         auto Fn = M.getFunction(func.getName());
         std::lock_guard<std::mutex> lock(mtx);
         if (externalFunction.count(Fn) && !func.isDeclaration()) {
@@ -572,8 +577,8 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
     }
     {
       std::lock_guard<std::mutex> lock(mtx);
-      LLVM_DEBUG(dbgs() << MPart->getModuleIdentifier() << "  : \n");
-      for (auto &F : *MPart) {
+      LLVM_DEBUG(dbgs() << MParts[I]->getModuleIdentifier() << "  : \n");
+      for (auto &F : *MParts[I]) {
         if (!F.isDeclaration())
           LLVM_DEBUG(dbgs() << "   [Function: ] " << F.getName() << " " << F.getLinkage() << "\n");
       }
@@ -584,12 +589,14 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
       std::lock_guard<std::mutex> lock(mtx);
       LLVM_DEBUG(dbgs() << "partition "<< I  << "  : " << Elapsed.count() << " ms\n");
     }
-    ModuleCallback(std::move(MPart));
   }
+
+  for (unsigned I = 0; I < N; ++I)
+    ModuleCallback(std::move(MParts[I]));
 }
 
-SplitModuleCG::SplitModuleCG(Module &M, unsigned LimitPartition)
-    : M(M), CG(M), N(LimitPartition) {
+SplitModuleCG::SplitModuleCG(Module &M, unsigned LimitPartition, ThreadPool *PartitionThreadPool)
+    : M(M), CG(M), N(LimitPartition), PartitionThreadPool(PartitionThreadPool) {
   // record origin externals
   auto recordIfExternal = [&](const GlobalValue &GV) {
     if (!GV.hasLocalLinkage())
