@@ -13,6 +13,7 @@
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/CallGraphSCCPass.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
+#include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/ADT/SCCIterator.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -81,6 +82,13 @@ static cl::opt<bool> EnableExternalClone(
     "enable-external-clone", cl::Hidden, cl::init(false),
     cl::desc(""));
 
+static cl::opt<bool> SplitBasedHotFuncs(
+    "split-based-on-hot-func", cl::Hidden, cl::init(false),
+    cl::desc(""));
+
+static cl::opt<bool> CloneHotExternalOnly(
+    "clone-hot-external-only", cl::Hidden, cl::init(false),
+    cl::desc(""));
 
 using GetTTIFn = function_ref<const TargetTransformInfo &(Function &)>;
 using PartitionID = unsigned;
@@ -261,6 +269,18 @@ void SplitModuleCG::calculateFunctionCosts() {
   }
 }
 
+void SplitModuleCG::getHotFunction() {
+  ProfileSummaryInfo PSI(M);
+  if(!PSI.hasProfileSummary())
+    return;	  
+
+  for (Function &F : M) {
+    if (F.hasFnAttribute(Attribute::Hot) || PSI.isFunctionEntryHot(&F)) {
+      HotFuncs.insert(&F);
+    }
+  }
+}
+
 void SplitModuleCG::getLargeFunction() {
   for (auto &FCItem : FuncsCosts) {
     if (FCItem.second > SplitCGFunctionSizeThreshold) {
@@ -382,7 +402,7 @@ void SplitModuleCG::splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &Wo
     auto *CallNode = SCG->getOrInsertFunction(FWD.F);
     for (auto &CalleeNode : *SCG->at(FWD.F)) {
       auto *Callee = CalleeNode->getFunction();
-      if (AliasesFuncs.count(Callee) || !CalleeNode->CheckCallDepth())
+      if (AliasesFuncs.count(Callee)|| HotFuncs.count(Callee) || !CalleeNode->CheckCallDepth())
         continue;
 
       // split
@@ -412,8 +432,8 @@ bool SplitModuleCG::shouldCloneFunction(const Function *Fn) {
     F_tmp->setLinkage(GlobalValue::InternalLinkage);
     return true;
   }
-  if (!EnableExternalClone) {
-    if (externalFunction.count(Fn)) {
+  if (!EnableExternalClone || CloneHotExternalOnly) {
+    if (externalFunction.count(Fn) && !HotFuncs.count(Fn)) {
       if (!externalFunction[Fn]) {
         return false;
       } else {
@@ -564,8 +584,7 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
     if (EnableExternalClone) {
       for (auto &func : MParts[I]->functions()) {
         auto Fn = M.getFunction(func.getName());
-        std::lock_guard<std::mutex> lock(mtx);
-        if (externalFunction.count(Fn) && !func.isDeclaration()) {
+        if (externalFunction.count(Fn) && !func.isDeclaration() && (HotFuncs.count(Fn) || !CloneHotExternalOnly )) {
           if (!externalFunction[Fn]) {
             func.setLinkage(GlobalValue::AvailableExternallyLinkage);
             func.setComdat(nullptr);
@@ -609,7 +628,13 @@ SplitModuleCG::SplitModuleCG(Module &M, unsigned LimitPartition, ThreadPool *Par
   if (SplitCGFunctionSizeThreshold != 0)
     getLargeFunction();
 
-  SCG = std::make_unique<SimplifyCallGraph>(CG, LargeFuncs, AliasesFuncs);
+  if(SplitBasedHotFuncs)
+    getHotFunction();
+
+  LLVM_DEBUG(dbgs() << HotFuncs.size() <<" hot functions in module "  << M.getName()<<" \n");
+
+
+  SCG = std::make_unique<SimplifyCallGraph>(CG, LargeFuncs, HotFuncs, AliasesFuncs);
   calculateEntryFuncs();
   if (N == 0 || N > EntryFuncs.size()) {
     N = EntryFuncs.size();
@@ -638,7 +663,7 @@ void SimplifyCallGraph::createSimplifyCallGraph() {
         }
       }
       if (!Called || Called->isDeclaration() ||
-          (LargeFuncs.find(Called) != LargeFuncs.end() &&
+          (LargeFuncs.find(Called) != LargeFuncs.end() && HotFuncs.find(Called) != HotFuncs.end() &&
            !AliasesFuncs.count(Called)))
         continue;
       SCGNode->addCalledFunction(getOrInsertFunction(Called));

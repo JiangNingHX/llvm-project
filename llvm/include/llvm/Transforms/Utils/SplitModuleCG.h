@@ -26,8 +26,9 @@ class SimplifyCallGraph {
 public:
   explicit SimplifyCallGraph (CallGraph &CG,
                               DenseSet<const Function *> &LargeFuncs,
+                              DenseSet<const Function *> &HotFuncs,
                               DenseSet<const Function *> &AliasesFuncs)
-         : CG(CG), LargeFuncs(LargeFuncs), AliasesFuncs(AliasesFuncs) {
+         : CG(CG), LargeFuncs(LargeFuncs), HotFuncs(HotFuncs), AliasesFuncs(AliasesFuncs) {
     createSimplifyCallGraph();
   }
   ~SimplifyCallGraph() {};
@@ -76,6 +77,7 @@ public:
 private:
   CallGraph &CG;
   DenseSet<const Function *> &LargeFuncs;
+  DenseSet<const Function *> &HotFuncs;
   DenseSet<const Function *> &AliasesFuncs;
 };
 
@@ -231,6 +233,7 @@ private:
   CostType ModuleCost;
   DenseSet<const Function *> EntryFuncs;
   DenseSet<const Function *> LargeFuncs;
+  DenseSet<const Function *> HotFuncs;
   DenseSet<const Function *> DependenciesForMain;
   DenseSet<const Function *> AliasesFuncs;
   DenseSet<const Function *> IfuncFuncs;
@@ -243,6 +246,7 @@ private:
   void calculateEntryFuncs();
   void calculateFunctionCosts();
   void getLargeFunction();
+  void getHotFunction();
   void getAliasFunction();
   void getIfuncFunction();
   void splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &WorkList);
