@@ -77,6 +77,11 @@ static cl::opt<int> SplitCGFunctionSizeThreshold(
     cl::desc("split the large function from the callgraph as the new root;"
              "e.g. the codesize of function over the cost of 500."));
 
+static cl::opt<bool> EnableExternalClone(
+    "enable-external-clone", cl::Hidden, cl::init(false),
+    cl::desc(""));
+
+
 using GetTTIFn = function_ref<const TargetTransformInfo &(Function &)>;
 using PartitionID = unsigned;
 
@@ -407,12 +412,14 @@ bool SplitModuleCG::shouldCloneFunction(const Function *Fn) {
     F_tmp->setLinkage(GlobalValue::InternalLinkage);
     return true;
   }
-  if (externalFunction.count(Fn)) {
-    if (!externalFunction[Fn]) {
-      return true;
-    } else {
-      //externalFunction[Fn] = false;
-      return true;
+  if (!EnableExternalClone) {
+    if (externalFunction.count(Fn)) {
+      if (!externalFunction[Fn]) {
+        return false;
+      } else {
+        externalFunction[Fn] = false;
+        return true;
+      }
     }
   }
   return true;
@@ -549,14 +556,17 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
         GV.eraseFromParent();
     }
 
-    for (auto &func : MPart->functions()) {
-      auto Fn = M.getFunction(func.getName());
-      std::lock_guard<std::mutex> lock(mtx);
-      if (externalFunction.count(Fn) && !func.isDeclaration()) {
-        if (!externalFunction[Fn]) {
-          func.setLinkage(GlobalValue::WeakODRLinkage);
-        } else {
-          externalFunction[Fn] = false;
+    if (EnableExternalClone) {
+      for (auto &func : MPart->functions()) {
+        auto Fn = M.getFunction(func.getName());
+        std::lock_guard<std::mutex> lock(mtx);
+        if (externalFunction.count(Fn) && !func.isDeclaration()) {
+          if (!externalFunction[Fn]) {
+            func.setLinkage(GlobalValue::AvailableExternallyLinkage);
+            func.setComdat(nullptr);
+          } else {
+            externalFunction[Fn] = false;
+          }
         }
       }
     }
