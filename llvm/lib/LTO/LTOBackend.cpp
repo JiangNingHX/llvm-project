@@ -651,8 +651,16 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
 
         unsigned CurrentThreadId = ThreadCount++;
 
-        assert(!TaskIdAllocator::isPartition(task) &&
-               "Original ThinLTO TaskId unexpectedly overlaps the partition namespace");
+        // In distributed ThinLTO, `task` may be a sentinel (e.g. -1 cast to
+        // unsigned), which becomes UINT_MAX and naturally has MSB==1. Treat it
+        // as "no base task id" and don't enforce the namespace check on it.
+        //
+        // We do not rely on the incoming `task` for partition uniqueness: split
+        // partitions get a dedicated UniqueTaskId allocated below.
+        if (task != std::numeric_limits<unsigned>::max()) {
+          assert(!TaskIdAllocator::isPartition(task) &&
+                 "Original ThinLTO TaskId unexpectedly overlaps the partition namespace");
+        }
         unsigned UniqueTaskId = gSplitTaskIds.alloc();
 
 
