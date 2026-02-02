@@ -214,14 +214,23 @@ doPartitioning(Module &M, unsigned NumParts,
       continue;
     }
 
-    // If the function is an ifunc, it must stay in the first partition.
-    if (CurFn.isIfuncResolver) {
+    // If the function is an ifunc, it must stay in the every partition.
+    if (CurFn.HasIfuncResolver) {
       {std::lock_guard<std::mutex> lock(mtx);
       LLVM_DEBUG(dbgs() << "Function with ifunc call(s): " << CurFn.F->getName()
-                        << " defaulting to P0\n");}
+                        << " defaulting to P_i\n");}
       for (int part_i = 0; part_i < NumParts; ++part_i) {
         AssignToPartition(part_i, CurFn);
       }
+      continue;
+    }
+
+    // If the function is in a comdat, it must stay in the first partition.
+    if (CurFn.HasComdatMember) {
+      {std::lock_guard<std::mutex> lock(mtx);
+      LLVM_DEBUG(dbgs() << "Function with comdat member(s): " << CurFn.F->getName()
+                        << " defaulting to P0\n");}
+      AssignToPartition(0, CurFn);
       continue;
     }
 
@@ -370,15 +379,25 @@ void SplitModuleCG::calculateEntryFuncs() {
 void SplitModuleCG::UpdateFWDInfo(llvm::FunctionWithDependencies &FWD) {
   FWD.Dependencies.clear();
   FWD.HasAliasesCall = false;
+  FWD.HasIfuncResolver = false;
+  FWD.HasComdatMember = false;
   addAllDependencies(*SCG, *FWD.F, FWD.Dependencies, externalFunction);
   FWD.TotalCost = FuncsCosts.lookup(FWD.F);
   if (AliasesFuncs.count(FWD.F))
     FWD.HasAliasesCall = true;
+  if (IfuncFuncs.count(FWD.F))
+    FWD.HasIfuncResolver = true;
+  if (ComdatFuncs.count(FWD.F))
+    FWD.HasComdatMember = true;
 
   for (const auto *Dep : FWD.Dependencies) {
     FWD.TotalCost += FuncsCosts.lookup(Dep);
     if (AliasesFuncs.count(Dep))
       FWD.HasAliasesCall = true;
+    if (IfuncFuncs.count(Dep))
+      FWD.HasIfuncResolver = true;
+    if (ComdatFuncs.count(Dep))
+      FWD.HasComdatMember = true;
   }
 }
 
@@ -417,7 +436,7 @@ void SplitModuleCG::splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &Wo
       if (EntryFuncs.find(F) != EntryFuncs.end())
         continue;
       WorkList.emplace_back(*SCG, FuncsCosts, F, 
-                            AliasesFuncs, externalFunction, IfuncFuncs);
+                            AliasesFuncs, externalFunction, IfuncFuncs, ComdatFuncs);
       WorkList[WorkList.size() - 1].SplitedLayer = SplitedLayer + 1;
       NewWorkList.push_back(WorkList.size() - 1);
     }
@@ -445,6 +464,23 @@ bool SplitModuleCG::shouldCloneFunction(const Function *Fn) {
   return true;
 }
 
+void SplitModuleCG::calculateComdatMembers() {
+  for (GlobalValue &GValue : M.global_values()) {
+    if (Comdat *C = GValue.getComdat()) {
+      ComdatMembers[C].insert(&GValue);
+    }
+  }
+
+  for (auto &ComdatMember : ComdatMembers) {
+    if (ComdatMember.second.size() > 1) {
+      for (auto *GValue : ComdatMember.second) {
+        if (auto *F = dyn_cast<Function>(GValue))
+          ComdatFuncs.insert(F);
+      }
+    }
+  }
+}
+
 using Clock = std::chrono::high_resolution_clock;
 using Ms = std::chrono::milliseconds;
 
@@ -462,11 +498,12 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
       externalize(&GV);
   }
   getIfuncFunction();
+  calculateComdatMembers();
 
   SmallVector<FunctionWithDependencies> WorkList;
   for (auto *F : EntryFuncs) {
     WorkList.emplace_back(*SCG, FuncsCosts, F, 
-                          AliasesFuncs, externalFunction, IfuncFuncs);
+                          AliasesFuncs, externalFunction, IfuncFuncs, ComdatFuncs);
   }
 
   if (enableSplitCallGraph)

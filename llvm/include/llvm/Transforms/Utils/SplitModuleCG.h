@@ -1,6 +1,7 @@
 #ifndef LLVM_TRANSFORMS_UTILS_SPLITMODULECG_H
 #define LLVM_TRANSFORMS_UTILS_SPLITMODULECG_H
 
+#include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Target/TargetMachine.h"
@@ -175,14 +176,18 @@ struct FunctionWithDependencies {
                            const Function *F,
                            const DenseSet<const Function *> &AliasesFuncs,
                            DenseMap<const Function *, bool> &externalFunction,
-			   const DenseSet<const Function *> &IfuncFuncs)
+			                     const DenseSet<const Function *> &IfuncFuncs,
+                           const DenseSet<const Function *> &ComdatFuncs)
       : F(F) {
     addAllDependencies(SCG, *F, Dependencies, externalFunction);
     if (AliasesFuncs.count(F))
       HasAliasesCall = true;
-    // If the function is an ifunc resolver, it must stay in the first partition.
+    // If the function is an ifunc resolver, it must stay in the every partition.
     if (IfuncFuncs.count(F))
-      isIfuncResolver = true;
+      HasIfuncResolver = true;
+    // If the function is in a comdat, it must stay in the first partition.
+    if (ComdatFuncs.count(F))
+      HasComdatMember = true;
 
     TotalCost = FnCosts.at(F);
     for (const auto *Dep : Dependencies) {
@@ -190,16 +195,18 @@ struct FunctionWithDependencies {
       if (AliasesFuncs.count(Dep))
         HasAliasesCall = true;
       if (IfuncFuncs.count(Dep))
-        isIfuncResolver = true;
+        HasIfuncResolver = true;
+      if (ComdatFuncs.count(Dep))
+        HasComdatMember = true;
     }
   }
-
 
   const Function *F = nullptr;
   DenseSet<const Function *> Dependencies;
   /// Whether \p F or any of its \ref Dependencies contains an indirect call.
   bool HasAliasesCall = false;
-  bool isIfuncResolver = false;
+  bool HasIfuncResolver = false;
+  bool HasComdatMember = false;
   
   CostType TotalCost = 0;
   int SplitedLayer = 0;
@@ -237,14 +244,17 @@ private:
   DenseSet<const Function *> DependenciesForMain;
   DenseSet<const Function *> AliasesFuncs;
   DenseSet<const Function *> IfuncFuncs;
+  DenseSet<const Function *> ComdatFuncs;
   StringSet<> OriginalExternals;
   StringMap<std::string> PromotedRenames;
   DenseMap<const Function *, bool> externalFunction;
   DenseMap<const Function *, CostType> FuncsCosts;
   ThreadPool *PartitionThreadPool;
+  DenseMap<const Comdat *, DenseSet<const GlobalValue *>> ComdatMembers;
 
   void calculateEntryFuncs();
   void calculateFunctionCosts();
+  void calculateComdatMembers();
   void getLargeFunction();
   void getHotFunction();
   void getAliasFunction();
