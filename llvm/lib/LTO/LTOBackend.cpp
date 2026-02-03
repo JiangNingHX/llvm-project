@@ -501,9 +501,40 @@ static void codegen(const Config &Conf, TargetMachine *TM,
     DwoFile = Conf.DwoDir;
     sys::path::append(DwoFile, std::to_string(Task) + ".dwo");
     TM->Options.MCOptions.SplitDwarfFile = std::string(DwoFile);
-  } else
-    TM->Options.MCOptions.SplitDwarfFile = Conf.SplitDwarfFile;
+  } else {
+    // Keep original behavior for sentinel task id (-1 casted to unsigned).
+    // In this mode the output path is fixed (Conf.SplitDwarfOutput).
+    if (Task == std::numeric_limits<unsigned>::max()) {
+      TM->Options.MCOptions.SplitDwarfFile = Conf.SplitDwarfFile;
+    } else if (!DwoFile.empty()) {
+      // Derive a unique filename by injecting ".<Task>" before extension.
+      llvm::StringRef Dir  = sys::path::parent_path(DwoFile);
+      llvm::StringRef Stem = sys::path::stem(DwoFile);
+      llvm::StringRef Ext  = sys::path::extension(DwoFile); // usually ".dwo"
 
+      llvm::SmallString<1024> UniquePath;
+      if (!Dir.empty()) {
+        UniquePath = Dir;
+        sys::path::append(UniquePath, "");
+      }
+
+      llvm::SmallString<256> Name;
+      Name += Stem;
+      Name += ".";
+      Name += llvm::utostr(Task);
+      Name += Ext.empty() ? ".dwo" : Ext;
+
+      if (!Dir.empty())
+        sys::path::append(UniquePath, Name);
+      else
+        UniquePath = Name;
+
+      DwoFile = UniquePath;
+      TM->Options.MCOptions.SplitDwarfFile = std::string(DwoFile);
+    } else {
+      TM->Options.MCOptions.SplitDwarfFile = Conf.SplitDwarfFile;
+    }
+  }
   if (!DwoFile.empty()) {
     std::error_code EC;
     DwoOut = std::make_unique<ToolOutputFile>(DwoFile, EC, sys::fs::OF_None);
