@@ -90,6 +90,10 @@ static cl::opt<bool> CloneHotExternalOnly(
     "clone-hot-external-only", cl::Hidden, cl::init(false),
     cl::desc(""));
 
+static cl::opt<bool> EnabalInternal2External(
+    "enable-internal2external", cl::Hidden, cl::init(false),
+    cl::desc(""));
+
 using GetTTIFn = function_ref<const TargetTransformInfo &(Function &)>;
 using PartitionID = unsigned;
 
@@ -488,8 +492,12 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
     bool PreserveLocals) {
   if (!PreserveLocals) {
     for (Function &F : M) {
-      if (F.hasAddressTaken())
+      if (EnabalInternal2External) {
         externalize(&F);
+      } else {
+        if (F.hasAddressTaken())
+          externalize(&F);
+      }
       if (!F.isDeclaration())
         if (F.hasExternalLinkage() || !F.isDefinitionExact())
           externalFunction[&F] = true;
