@@ -5,7 +5,11 @@
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CallGraph.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/InlineCost.h"
 #include "llvm/Support/InstructionCost.h"
 #include "llvm/Support/ThreadPool.h"
 #include <memory>
@@ -137,6 +141,36 @@ private:
   void AddRef() { ++NumReferences; }
 };
 
+/// Helper class to generate disjoint clusters based on the inline viability
+/// estimation for the callgraph so avoiding to lose inline oppotunities by
+/// doing callgraph split by keeping functions in each cluster in one partition.
+class InlineClusterEstimation {
+public:
+  InlineClusterEstimation(Module &M, CallGraph &CG, TargetMachine *TM);
+  bool fromSameCluster(const Function *A, const Function *B);
+private:
+  Module &M;
+  CallGraph &CG;
+  TargetMachine *TM;
+
+  /// Reconstruct and cache necessary analysis results.
+  DenseMap<Function *, std::unique_ptr<AssumptionCache>> ACs;
+  DenseMap<Function *, std::unique_ptr<TargetTransformInfo>> TTIs;
+  std::unique_ptr<TargetLibraryInfoImpl> TLII;
+  std::unique_ptr<TargetLibraryInfo> TLI;
+  std::function<AssumptionCache &(Function &)> GetAC;
+  std::function<const TargetLibraryInfo &(Function &)> GetTLI;
+  std::function<TargetTransformInfo &(Function &)> GetTTI;
+  DenseMap<const Function *, const Function *> ClusterRoot;
+
+  /// Internal methods to build the clusters from callgraph nodes.
+  DenseMap<const Function *, unsigned> ClusterRank;
+  void addTransitiveCallToClusters();
+  void insertToCluster(const Function *A);
+  const Function *findFromClusters(const Function *A);
+  void unite(const Function *A, const Function *B);
+};
+
 /// Adds the functions that \p F may call to \p Fns, then recurses into each
 /// callee until all reachable functions have been gathered.
 ///
@@ -237,6 +271,7 @@ private:
   Module &M;
   CallGraph CG;
   std::unique_ptr<SimplifyCallGraph> SCG;
+  std::unique_ptr<InlineClusterEstimation> IPE = nullptr;
   CostType ModuleCost;
   DenseSet<const Function *> EntryFuncs;
   DenseSet<const Function *> LargeFuncs;

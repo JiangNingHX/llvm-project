@@ -3,6 +3,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/User.h"
@@ -81,6 +82,10 @@ static cl::opt<int> SplitCGFunctionSizeThreshold(
 static cl::opt<bool> EnableExternalClone(
     "enable-external-clone", cl::Hidden, cl::init(false),
     cl::desc(""));
+
+static cl::opt<bool> enableInlineClusterEstimation(
+    "enable-inline-profit-estimation", cl::Hidden, cl::init(true),
+    cl::desc("avoid spliting caller and callee when the callee can be inline."));
 
 static cl::opt<bool> SplitBasedHotFuncs(
     "split-based-on-hot-func", cl::Hidden, cl::init(false),
@@ -428,6 +433,11 @@ void SplitModuleCG::splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &Wo
       if (AliasesFuncs.count(Callee)|| HotFuncs.count(Callee) || !CalleeNode->CheckCallDepth())
         continue;
 
+      if (enableInlineClusterEstimation)
+        // Do not split the callgraph edge if caller and callee are in the same cluster.
+        if (IPE->fromSameCluster(FWD.F, Callee))
+          continue;
+
       // split
       CallNode->removeCalledFunction(CalleeNode);
       externalize(Callee);
@@ -513,6 +523,9 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
     WorkList.emplace_back(*SCG, FuncsCosts, F, 
                           AliasesFuncs, externalFunction, IfuncFuncs, ComdatFuncs);
   }
+
+  if (enableInlineClusterEstimation && enableSplitCallGraph)
+    IPE = std::make_unique<InlineClusterEstimation>(M, CG, TM);
 
   if (enableSplitCallGraph)
     splitLargeCG(WorkList);
@@ -773,4 +786,97 @@ bool SimplifyCallGraphNode::dfsSimplifyCallGraph(
 bool SimplifyCallGraphNode::CheckCallDepth() {
   DenseMap<SimplifyCallGraphNode *, bool> visited;
   return dfsSimplifyCallGraph(this, visited, 0);
+}
+
+/// Reconstruct the analysis results and build the disjoint clusters based on inline cost model.
+InlineClusterEstimation::InlineClusterEstimation(Module &M, CallGraph &CG, TargetMachine *TM)
+    : M(M), CG(CG), TM(TM) {
+  Triple TargetTriple(M.getTargetTriple());
+  TLII = std::make_unique<TargetLibraryInfoImpl>(TargetTriple);
+  TLI = std::make_unique<TargetLibraryInfo>(*TLII);
+
+  GetTTI = [this](Function &F) -> TargetTransformInfo & {
+    auto &TTI = TTIs[&F];
+    if (!TTI) {
+      TTI = std::make_unique<TargetTransformInfo>(this->TM->getTargetTransformInfo(F));
+    }
+    return *TTI;
+  };
+  GetAC = [this](Function &F) -> AssumptionCache & {
+    auto &AC = ACs[&F];
+    if (!AC) {
+      AC = std::make_unique<AssumptionCache>(F);
+    }
+    return *AC;
+  };
+  GetTLI = [this](Function &F) -> const TargetLibraryInfo & {
+    return *TLI;
+  };
+
+  addTransitiveCallToClusters();
+}
+
+bool InlineClusterEstimation::fromSameCluster(const Function *A, const Function *B){
+  return findFromClusters(A) == findFromClusters(B);
+}
+
+void InlineClusterEstimation::addTransitiveCallToClusters() {
+  auto isInlineViable = [this](const Function *Caller, const Function *Callee) -> bool {
+    Function *A = const_cast<Function *>(Caller);
+    Function *B = const_cast<Function *>(Callee);
+    for (Instruction &I : instructions(A)) {
+      if (CallBase *CB = dyn_cast<CallBase>(&I))
+        if (CB->getCalledFunction() == B) {
+          InlineCost IC = getInlineCost(*CB, B, getInlineParams(), GetTTI(*B), GetAC, GetTLI);
+          return IC.isAlways() || (!IC.isNever() && IC.getCost() < IC.getThreshold());
+        }
+    }
+    return false;
+  };
+
+  for (auto &F : M.functions())
+    if (!F.isDeclaration())
+      insertToCluster(&F);
+  
+  for (auto &NodePair : CG) {
+    CallGraphNode *CGNode = NodePair.second.get();
+    const Function *Caller = CGNode->getFunction();
+    if (!Caller || Caller->isDeclaration())
+      continue;
+
+    for (const auto &CGNodeItem : *CGNode) {
+      const Function *Callee = CGNodeItem.second->getFunction();
+      if (!Callee || Caller->isDeclaration())
+        continue;
+
+      if (isInlineViable(Caller, Callee))
+        unite(Caller, Callee);
+    }
+  }
+}
+
+void InlineClusterEstimation::insertToCluster(const Function *A) {
+  if (ClusterRoot.find(A) == ClusterRoot.end()) {
+    ClusterRoot[A] = A;
+    ClusterRank[A] = 0;
+  }
+}
+
+const Function *InlineClusterEstimation::findFromClusters(const Function *A) {
+  insertToCluster(A);
+  if (ClusterRoot[A] == A)
+    return A;
+  return ClusterRoot[A] = findFromClusters(ClusterRoot[A]);
+}
+
+void InlineClusterEstimation::unite(const Function *A, const Function *B) {
+  const Function *RootA = findFromClusters(A);
+  const Function *RootB = findFromClusters(B);
+  if (RootA != RootB) {
+    if (ClusterRank[RootA] < ClusterRank[RootB])
+      std::swap(RootA, RootB);
+    if (ClusterRank[RootA] == ClusterRank[RootB])
+      ++ClusterRank[RootA];
+    ClusterRoot[RootB] = RootA;
+  }
 }
