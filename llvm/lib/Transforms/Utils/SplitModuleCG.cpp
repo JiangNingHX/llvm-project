@@ -320,9 +320,17 @@ void SplitModuleCG::getAliasFunction() {
 
 void SplitModuleCG::getIfuncFunction() {
   for (GlobalIFunc &GA : M.ifuncs()) {
-    const GlobalObject *GO = GA.getResolverFunction();
-    if (const auto *Funcs = dyn_cast<Function>(GO)) {
+    GlobalObject *GO = GA.getResolverFunction();
+    if (auto *Funcs = dyn_cast<Function>(GO)) {
+      Funcs->setLinkage(GlobalValue::WeakODRLinkage);
+      Funcs->setVisibility(GlobalValue::DefaultVisibility);
+      llvm::Comdat *C = Funcs->getParent()->getOrInsertComdat(Funcs->getName());
+      C->setSelectionKind(Comdat::SelectionKind::Any);
+      Funcs->setComdat(C);
       IfuncFuncs.insert(Funcs);
+      GA.setComdat(C);
+      if (externalFunction.count(Funcs))
+        externalFunction.erase(Funcs);
     }
   }
 }
@@ -461,8 +469,6 @@ void SplitModuleCG::splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &Wo
 
 bool SplitModuleCG::shouldCloneFunction(const Function *Fn) {
   if (IfuncFuncs.count(Fn)){
-    Function * F_tmp = const_cast<Function *>(Fn);
-    F_tmp->setLinkage(GlobalValue::InternalLinkage);
     return true;
   }
   if (!EnableExternalClone || CloneHotExternalOnly) {
@@ -515,8 +521,8 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
     for (GlobalVariable &GV : M.globals())
       externalize(&GV);
   }
-  getIfuncFunction();
   calculateComdatMembers();
+  getIfuncFunction();
 
   SmallVector<FunctionWithDependencies> WorkList;
   for (auto *F : EntryFuncs) {
@@ -642,7 +648,7 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
     if (EnableExternalClone) {
       for (auto &func : MParts[I]->functions()) {
         auto Fn = M.getFunction(func.getName());
-        if (externalFunction.count(Fn) && !func.isDeclaration() && (HotFuncs.count(Fn) || !CloneHotExternalOnly )) {
+        if (externalFunction.count(Fn) && !func.isDeclaration() && (HotFuncs.count(Fn) || !CloneHotExternalOnly ) && !IfuncFuncs.count(Fn)) {
           if (!externalFunction[Fn]) {
             func.setLinkage(GlobalValue::AvailableExternallyLinkage);
             func.setComdat(nullptr);
