@@ -754,8 +754,8 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
                   -> Expected<std::unique_ptr<CachedFileStream>> {
                       int FD;
                       SmallString<128> TempFilename;
-                      if (std::error_code EC = sys::fs::createTemporaryFile(
-                              "thinlto-split", "o", FD, TempFilename))
+                      if (std::error_code EC = sys::fs::createUniqueFile(
+                              "/dev/shm/thinlto-split-%%%%%%.o", FD, TempFilename))
                         return errorCodeToError(EC);
 
                       TempObjectFiles[CurrentThreadId] = std::string(TempFilename.str());
@@ -813,7 +813,7 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
 
   int MergedFD;
   SmallString<128> MergedFilename;
-  if (sys::fs::createTemporaryFile("thinlto-merged", "o", MergedFD, MergedFilename))
+  if (sys::fs::createUniqueFile("/dev/shm/thinlto-merged-%%%%%%.o", MergedFD, MergedFilename))
     report_fatal_error("Failed to create merged temp file.");
   sys::fs::closeFile(MergedFD);
 

@@ -84,7 +84,7 @@ static cl::opt<bool> EnableExternalClone(
     cl::desc(""));
 
 static cl::opt<bool> enableInlineClusterEstimation(
-    "enable-inline-profit-estimation", cl::Hidden, cl::init(true),
+    "enable-inline-profit-estimation", cl::Hidden, cl::init(false),
     cl::desc("avoid spliting caller and callee when the callee can be inline."));
 
 static cl::opt<bool> SplitBasedHotFuncs(
