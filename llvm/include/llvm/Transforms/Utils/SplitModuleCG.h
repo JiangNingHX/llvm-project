@@ -266,6 +266,9 @@ public:
   StringSet<> &getOriginalExternals() { return OriginalExternals; }
   StringMap<std::string> &getPromotedRenames() { return PromotedRenames; }
 
+  DenseMap<StringRef, bool> &getChangeLinkageFunction() {return ChangeLinkageFuncs;}
+  DenseSet<const Function *> &getIfuncFuncs() {return IfuncFuncs;}
+  
 private:
   unsigned N;
   Module &M;
@@ -280,6 +283,8 @@ private:
   DenseSet<const Function *> AliasesFuncs;
   DenseSet<const Function *> IfuncFuncs;
   DenseSet<const Function *> ComdatFuncs;
+  DenseSet<const Function *> IndirectCalleeFuncs;
+  DenseMap<StringRef, bool> ChangeLinkageFuncs;
   StringSet<> OriginalExternals;
   StringMap<std::string> PromotedRenames;
   DenseMap<const Function *, bool> externalFunction;
@@ -297,6 +302,8 @@ private:
   void splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &WorkList);
   void UpdateFWDInfo(llvm::FunctionWithDependencies &FWD);
   bool shouldCloneFunction(const Function *Fn);
+  void stripDeclareDebugInfoImpl(Module &Mpart, int I);
+  void stripRetainedDebugInfoImpl(Module &Mpart, int I);
 };
 
 } // end namespace llvm

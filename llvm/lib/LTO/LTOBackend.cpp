@@ -44,6 +44,8 @@
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/IPO/ElimAvailExtern.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/TargetParser/SubtargetFeature.h"
 #include "llvm/Transforms/IPO/SampleProfile.h"
 #include "llvm/Transforms/IPO/WholeProgramDevirt.h"
@@ -315,6 +317,17 @@ static void runProfileLoaderPass(const Config &Conf, Module &Mod,
 			              PGOOpt->ProfileRemappingFile,
 				      ThinOrFullLTOPhase::ThinLTOPostLink));
   MPM.addPass(RequireAnalysisPass<ProfileSummaryAnalysis, Module>());
+  MPM.run(Mod, MAM);
+}
+
+static void runGlobalDCEPass(Module &Mod) {
+  ModuleAnalysisManager MAM;
+  PassBuilder PB;
+  PB.registerModuleAnalyses(MAM);
+
+  ModulePassManager MPM;
+  MPM.addPass(EliminateAvailableExternallyPass());
+  MPM.addPass(GlobalDCEPass());
   MPM.run(Mod, MAM);
 }
 
@@ -648,6 +661,7 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
   std::atomic<long> TotalOptTime{0};
   std::atomic<long> TotalCodeGenTime{0};
   static std::mutex PrintMutex;
+  static std::mutex ChangeLinkageMutex;
   auto Mname = Mod.getModuleIdentifier();
 
   SplitModuleCG SplitModuleCG(Mod, ParallelCodeGenParallelismLevel, PartitionThreadPool);
@@ -735,6 +749,28 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
                   TotalOptTime +=
                       std::chrono::duration_cast<Ms>(EndOpt - StartOpt).count();
                 }
+              }
+
+              {
+                // change linkage from internal to external
+                auto &ChangeLinkageFuncs = SplitModuleCG.getChangeLinkageFunction();
+                std::lock_guard<std::mutex> Lock(ChangeLinkageMutex);
+                for (auto &[FnName, ChangeLinkage] : ChangeLinkageFuncs) {
+                  if (auto Fn = MPartInCtx->getFunction(FnName)) {
+                    if (Fn->isDeclaration() || !Fn->hasLocalLinkage())
+                        continue;
+                    if (!ChangeLinkage) {
+                      Fn->setLinkage(GlobalValue::ExternalLinkage);
+                      ChangeLinkageFuncs[FnName] = true;
+                    } else {
+                      Fn->setLinkage(GlobalValue::AvailableExternallyLinkage);
+                      Fn->setSubprogram(nullptr);
+                      Fn->setComdat(nullptr);
+                    }
+                    Fn->setVisibility(GlobalValue::HiddenVisibility);
+                  }
+                }
+                runGlobalDCEPass(*MPartInCtx);
               }
 
               auto PromotedRenames = SplitModuleCG.getPromotedRenames();

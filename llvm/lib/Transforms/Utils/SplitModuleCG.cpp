@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Utils/SplitModuleCG.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/GlobalValue.h"
@@ -79,10 +80,6 @@ static cl::opt<int> SplitCGFunctionSizeThreshold(
     cl::desc("split the large function from the callgraph as the new root;"
              "e.g. the codesize of function over the cost of 500."));
 
-static cl::opt<bool> EnableExternalClone(
-    "enable-external-clone", cl::Hidden, cl::init(false),
-    cl::desc(""));
-
 static cl::opt<bool> enableInlineClusterEstimation(
     "enable-inline-profit-estimation", cl::Hidden, cl::init(false),
     cl::desc("avoid spliting caller and callee when the callee can be inline."));
@@ -95,9 +92,6 @@ static cl::opt<bool> CloneHotExternalOnly(
     "clone-hot-external-only", cl::Hidden, cl::init(false),
     cl::desc(""));
 
-static cl::opt<bool> EnabalInternal2External(
-    "enable-internal2external", cl::Hidden, cl::init(false),
-    cl::desc(""));
 
 using GetTTIFn = function_ref<const TargetTransformInfo &(Function &)>;
 using PartitionID = unsigned;
@@ -467,23 +461,6 @@ void SplitModuleCG::splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &Wo
   }
 }
 
-bool SplitModuleCG::shouldCloneFunction(const Function *Fn) {
-  if (IfuncFuncs.count(Fn)){
-    return true;
-  }
-  if (!EnableExternalClone || CloneHotExternalOnly) {
-    if (externalFunction.count(Fn) && !HotFuncs.count(Fn)) {
-      if (!externalFunction[Fn]) {
-        return false;
-      } else {
-        externalFunction[Fn] = false;
-        return true;
-      }
-    }
-  }
-  return true;
-}
-
 void SplitModuleCG::calculateComdatMembers() {
   for (GlobalValue &GValue : M.global_values()) {
     if (Comdat *C = GValue.getComdat()) {
@@ -506,21 +483,18 @@ using Ms = std::chrono::milliseconds;
 
 void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback ModuleCallback,
     bool PreserveLocals) {
-  if (!PreserveLocals) {
-    for (Function &F : M) {
-      if (EnabalInternal2External) {
-        externalize(&F);
-      } else {
-        if (F.hasAddressTaken())
-          externalize(&F);
-      }
-      if (!F.isDeclaration())
-        if (F.hasExternalLinkage() || !F.isDefinitionExact())
-          externalFunction[&F] = true;
+  for (Function &F : M) {
+    if (!F.hasAddressTaken()) {
+      ChangeLinkageFuncs[F.getName()] = false;
+    } else {
+      externalize(&F);
     }
-    for (GlobalVariable &GV : M.globals())
-      externalize(&GV);
+    if (!F.isDeclaration() && (F.hasExternalLinkage() || !F.isDefinitionExact()))
+      externalFunction[&F] = true;
   }
+  for (GlobalVariable &GV : M.globals())
+    externalize(&GV);
+
   calculateComdatMembers();
   getIfuncFunction();
 
@@ -547,8 +521,10 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
       // If this function is not part of any kernel's dependencies and isn't
       // directly called, consider it as a root.
       if (!F.isDeclaration() && !SeenFunctions.count(&F)) {
-        {std::lock_guard<std::mutex> lock(mtx);
-        LLVM_DEBUG(dbgs() << "!!!! lost function!!!! " << F.getName() << "\n");}
+        {
+          std::lock_guard<std::mutex> lock(mtx);
+          LLVM_DEBUG(dbgs() << "!!!! lost function!!!! " << F.getName() << "\n");
+        }
       }
     }
   }
@@ -576,11 +552,6 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
                           << externalFunction.count(F)<< " "<< FuncsCosts[F] << "\n");
       }
     }
-    // LLVM_DEBUG(dbgs() << " [externalFunctions] : " << "\n");
-    // for (auto it : externalFunction) {
-    //  LLVM_DEBUG(dbgs() << "                   " << it.first->getName()
-    //                    << " " << it.second << "\n");
-    //}
   }
 
   auto Partitions = doPartitioning(M, N, ModuleCost, FuncsCosts, WorkList, EntryFuncs);
@@ -608,10 +579,8 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
           CloneModule(M, VMap, [&](const GlobalValue *GV) {
             // Functions go in their assigned partition.
             if (const auto *Fn = dyn_cast<Function>(GV)) {
-              if (!FnsInPart.contains(Fn))
-                return false;
-              return shouldCloneFunction(Fn);
-            }
+              return FnsInPart.contains(Fn);
+	    }
 
             if (NeedsConservativeImport(GV))
               return true;
@@ -626,14 +595,13 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
     // collect symbols to rename
     auto checkPromoted = [&](const GlobalValue &GV) {
       // now is external (not local), but not in external set.
-      if (!GV.hasLocalLinkage() && !OriginalExternals.contains(GV.getName())) {
+      if ((!GV.hasLocalLinkage() || ChangeLinkageFuncs.count(GV.getName())) && !OriginalExternals.contains(GV.getName())) {
+        std::lock_guard<std::mutex> lock(mtx);
         if (PromotedRenames.count(GV.getName()))
           return;
-        std::string NewName =
-            GV.getName().str() + "_" + M.getModuleIdentifier();
-        PromotedRenames[GV.getName()] = NewName;
-        //LLVM_DEBUG(dbgs() << "Promoted Symbol: " << GV.getName() << " -> "
-          //                << NewName << "\n");
+        std::string NewName =	 
+             GV.getName().str() + "_" + M.getModuleIdentifier();	 
+         PromotedRenames[GV.getName()] = NewName;
       }
     };
     for (const auto &GV : MParts[I]->global_values())
@@ -645,19 +613,20 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
         GV.eraseFromParent();
     }
 
-    if (EnableExternalClone) {
-      for (auto &func : MParts[I]->functions()) {
-        auto Fn = M.getFunction(func.getName());
-        if (externalFunction.count(Fn) && !func.isDeclaration() && (HotFuncs.count(Fn) || !CloneHotExternalOnly ) && !IfuncFuncs.count(Fn)) {
-          if (!externalFunction[Fn]) {
-            func.setLinkage(GlobalValue::AvailableExternallyLinkage);
-            func.setComdat(nullptr);
-          } else {
-            externalFunction[Fn] = false;
-          }
+    for (auto &func : MParts[I]->functions()) {
+      auto Fn = M.getFunction(func.getName());
+      std::lock_guard<std::mutex> lock(mtx);
+      if (externalFunction.count(Fn) && !func.isDeclaration() && (HotFuncs.count(Fn) || !CloneHotExternalOnly) && !IfuncFuncs.count(Fn)) {
+        if (!externalFunction[Fn]) {
+          func.setLinkage(GlobalValue::AvailableExternallyLinkage);
+          func.setSubprogram(nullptr);
+          func.setComdat(nullptr);
+        } else {
+          externalFunction[Fn] = false;
         }
       }
     }
+
     {
       std::lock_guard<std::mutex> lock(mtx);
       LLVM_DEBUG(dbgs() << MParts[I]->getModuleIdentifier() << "  : \n");
