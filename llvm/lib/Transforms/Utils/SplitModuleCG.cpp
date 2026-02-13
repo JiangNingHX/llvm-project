@@ -710,7 +710,7 @@ void SimplifyCallGraph::createSimplifyCallGraph() {
         }
       }
       if (!Called || Called->isDeclaration() ||
-          (LargeFuncs.find(Called) != LargeFuncs.end() && HotFuncs.find(Called) != HotFuncs.end() &&
+          (LargeFuncs.find(Called) != LargeFuncs.end() && ( (HotFuncs.find(Called) == HotFuncs.end()) || !SplitBasedHotFuncs) &&
            !AliasesFuncs.count(Called)))
         continue;
       SCGNode->addCalledFunction(getOrInsertFunction(Called));
