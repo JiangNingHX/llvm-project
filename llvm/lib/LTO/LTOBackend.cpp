@@ -664,7 +664,8 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
   static std::mutex ChangeLinkageMutex;
   auto Mname = Mod.getModuleIdentifier();
 
-  SplitModuleCG SplitModuleCG(Mod, ParallelCodeGenParallelismLevel, PartitionThreadPool);
+  SplitModuleCG SplitModuleCG(Mod, C,
+                              ParallelCodeGenParallelismLevel, PartitionThreadPool);
   if (ThinLTOUseCG)
     ParallelCodeGenParallelismLevel = SplitModuleCG.getPartitionNum();
 
@@ -684,9 +685,9 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
         // spinning up new threads which deserialize the partitions into
         // separate contexts.
         // FIXME: Provide a more direct way to do this in LLVM.
-        SmallString<0> BC;
-        raw_svector_ostream BCOS(BC);
-        WriteBitcodeToFile(*MPart, BCOS);
+        // SmallString<0> BC;
+        // raw_svector_ostream BCOS(BC);
+        // WriteBitcodeToFile(*MPart, BCOS);
 
         if (ThinLTODebugMpart) {
           std::lock_guard<std::mutex> Lock(PrintMutex);
@@ -694,7 +695,9 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
           LLVM_DEBUG(MPart->dump());
         }
 
-        unsigned CurrentThreadId = ThreadCount++;
+        unsigned CurrentThreadId, UniqueTaskId;
+        {std::lock_guard<std::mutex> Lock(PrintMutex);
+        CurrentThreadId = ThreadCount++;
 
         // In distributed ThinLTO, `task` may be a sentinel (e.g. -1 cast to
         // unsigned), which becomes UINT_MAX and naturally has MSB==1. Treat it
@@ -706,26 +709,26 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
           assert(!TaskIdAllocator::isPartition(task) &&
                  "Original ThinLTO TaskId unexpectedly overlaps the partition namespace");
         }
-        unsigned UniqueTaskId = gSplitTaskIds.alloc();
+        UniqueTaskId = gSplitTaskIds.alloc();}
 
 
         // Enqueue the task
-        PartitionThreadPool->async(
-            [&, CurrentThreadId, UniqueTaskId](const SmallString<0> &BC) {
-              LTOLLVMContext Ctx(C);
-              Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(
-                  MemoryBufferRef(BC.str(), "ld-temp.o"),
-                  Ctx);
-              if (!MOrErr)
-                report_fatal_error("Failed to read bitcode");
-              std::unique_ptr<Module> MPartInCtx = std::move(MOrErr.get());
+        // PartitionThreadPool->async(
+        //     [&, CurrentThreadId, UniqueTaskId](const SmallString<0> &BC) {
+        //       LTOLLVMContext Ctx(C);
+        //       Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(
+        //           MemoryBufferRef(BC.str(), "ld-temp.o"),
+        //           Ctx);
+        //       if (!MOrErr)
+        //         report_fatal_error("Failed to read bitcode");
+        //       std::unique_ptr<Module> MPartInCtx = std::move(MOrErr.get());
 
               std::unique_ptr<TargetMachine> ThreadTM =
-                  createTargetMachine(C, T, *MPartInCtx);
+                  createTargetMachine(C, T, *MPart);
 
               if (DoOpt) {
                 auto StartOpt = Clock::now();
-                if (!opt(C, ThreadTM.get(), UniqueTaskId, *MPartInCtx, /*IsThinLTO=*/true,
+                if (!opt(C, ThreadTM.get(), UniqueTaskId, *MPart, /*IsThinLTO=*/true,
                          /*ExportSummary=*/nullptr, /*ImportSummary=*/&CombinedIndex,
                          CmdArgs)) {
                   report_fatal_error("Failed to gen opt for split mod in thread.");
@@ -756,7 +759,7 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
                 auto &ChangeLinkageFuncs = SplitModuleCG.getChangeLinkageFunction();
                 std::lock_guard<std::mutex> Lock(ChangeLinkageMutex);
                 for (auto &[FnName, ChangeLinkage] : ChangeLinkageFuncs) {
-                  if (auto Fn = MPartInCtx->getFunction(FnName)) {
+                  if (auto Fn = MPart->getFunction(FnName)) {
                     if (Fn->isDeclaration() || !Fn->hasLocalLinkage())
                         continue;
                     if (!ChangeLinkage) {
@@ -770,11 +773,11 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
                     Fn->setVisibility(GlobalValue::HiddenVisibility);
                   }
                 }
-                runGlobalDCEPass(*MPartInCtx);
+                runGlobalDCEPass(*MPart);
               }
 
               auto PromotedRenames = SplitModuleCG.getPromotedRenames();
-              for (auto &GV : MPartInCtx->global_values()) {
+              for (auto &GV : MPart->global_values()) {
                 if (auto It = PromotedRenames.find(GV.getName());
                     It != PromotedRenames.end()) {
                   GV.setName(It->second);
@@ -783,7 +786,7 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
               if (ThinLTODebugMpart) {
                 std::lock_guard<std::mutex> Lock(PrintMutex);
                 LLVM_DEBUG(dbgs() << "after rename, MPart " << Mname << "\n");
-                LLVM_DEBUG(MPartInCtx->dump());
+                LLVM_DEBUG(MPart->dump());
               }
 
               auto splitStream = [&](unsigned task, const Twine &moduleName) 
@@ -806,7 +809,7 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
                     };
 
               auto StartCG = Clock::now();
-              codegen(C, ThreadTM.get(), splitStream, UniqueTaskId, *MPartInCtx,
+              codegen(C, ThreadTM.get(), splitStream, UniqueTaskId, *MPart,
                       CombinedIndex);
               auto EndCG = Clock::now();
               if (ThinLTODebugMpart) {
@@ -819,10 +822,10 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
                 TotalCodeGenTime +=
                     std::chrono::duration_cast<Ms>(EndCG - StartCG).count();
               }
-            },
+            // },
             // Pass BC using std::move to ensure that it get moved rather than
             // copied into the thread's context.
-            std::move(BC));
+            // std::move(BC));
       };
 
   if (ThinLTOUseCG)

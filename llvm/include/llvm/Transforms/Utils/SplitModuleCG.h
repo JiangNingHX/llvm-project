@@ -12,6 +12,7 @@
 #include "llvm/Analysis/InlineCost.h"
 #include "llvm/Support/InstructionCost.h"
 #include "llvm/Support/ThreadPool.h"
+#include "llvm/LTO/Config.h"
 #include <memory>
 
 namespace llvm {
@@ -258,7 +259,8 @@ class SplitModuleCG {
 public:
   using ModuleCreationCallback =
       function_ref<void(std::unique_ptr<Module> MPart)>;
-  SplitModuleCG(Module &M, unsigned LimitPartition = 0, ThreadPool *PartitionThreadPool = nullptr);
+  SplitModuleCG(Module &M, const llvm::lto::Config &C,
+                unsigned LimitPartition = 0, ThreadPool *PartitionThreadPool = nullptr);
   void SplitModule(TargetMachine *TM, ModuleCreationCallback ModuleCallback,
       bool PreserveLocals);
 
@@ -290,6 +292,7 @@ private:
   DenseMap<const Function *, bool> externalFunction;
   DenseMap<const Function *, CostType> FuncsCosts;
   ThreadPool *PartitionThreadPool;
+  const llvm::lto::Config &C;
   DenseMap<const Comdat *, DenseSet<const GlobalValue *>> ComdatMembers;
 
   void calculateEntryFuncs();

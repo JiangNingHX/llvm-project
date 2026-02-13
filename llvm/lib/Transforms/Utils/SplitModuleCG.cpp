@@ -19,6 +19,8 @@
 #include "llvm/ADT/SCCIterator.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include <algorithm>
 #include <cassert>
 #include <iterator>
@@ -568,17 +570,30 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
   };
  
   unsigned TotalFnImpls = 0;
-  std::vector<std::unique_ptr<Module>> MParts(N);
+  SmallString<0> BC;
+  raw_svector_ostream BCOS(BC);
+  WriteBitcodeToFile(M, BCOS);
+  auto SharedBC = std::make_shared<std::string>(BC.str().str());
   for (unsigned I = 0; I < N; ++I) {
     auto TimeStart = Clock::now();
-    PartitionThreadPool->async([&, I]() {
+    PartitionThreadPool->async([&, I, SharedBC]() {
       const auto &FnsInPart = Partitions[I];
 
-      ValueToValueMapTy VMap;
-      std::unique_ptr<Module> MPart(
-          CloneModule(M, VMap, [&](const GlobalValue *GV) {
+      std::unique_ptr<Module> MPart;
+      llvm::lto::LTOLLVMContext Ctx(C);
+      {
+        Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(
+                  MemoryBufferRef(*SharedBC, "ld-temp.o"),
+                  Ctx);
+        if (!MOrErr)
+          report_fatal_error("Failed to read bitcode");
+        std::unique_ptr<Module> MInCtx = std::move(MOrErr.get());
+        ValueToValueMapTy VMap;
+        MPart =
+          CloneModule(*MInCtx, VMap, [&](const GlobalValue *GV) {
             // Functions go in their assigned partition.
-            if (const auto *Fn = dyn_cast<Function>(GV)) {
+            if (const auto *newFn = dyn_cast<Function>(GV)) {
+              const auto *Fn = M.getFunction(newFn->getName());
               return FnsInPart.contains(Fn);
 	    }
 
@@ -587,10 +602,8 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
 
             // Everything else goes in the first partition.
             return I == 0;
-          }));
-      MParts[I] = std::move(MPart);
-    });
-    PartitionThreadPool->wait();
+          });
+      }
 
     // collect symbols to rename
     auto checkPromoted = [&](const GlobalValue &GV) {
@@ -604,16 +617,16 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
          PromotedRenames[GV.getName()] = NewName;
       }
     };
-    for (const auto &GV : MParts[I]->global_values())
+    for (const auto &GV : MPart->global_values())
       checkPromoted(GV);
 
     // Clean-up conservatively imported GVs without any users.
-    for (auto &GV : make_early_inc_range(MParts[I]->globals())) {
+    for (auto &GV : make_early_inc_range(MPart->globals())) {
       if (NeedsConservativeImport(&GV) && GV.use_empty())
         GV.eraseFromParent();
     }
 
-    for (auto &func : MParts[I]->functions()) {
+    for (auto &func : MPart->functions()) {
       auto Fn = M.getFunction(func.getName());
       std::lock_guard<std::mutex> lock(mtx);
       if (externalFunction.count(Fn) && !func.isDeclaration() && (HotFuncs.count(Fn) || !CloneHotExternalOnly) && !IfuncFuncs.count(Fn)) {
@@ -629,8 +642,8 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
 
     {
       std::lock_guard<std::mutex> lock(mtx);
-      LLVM_DEBUG(dbgs() << MParts[I]->getModuleIdentifier() << "  : \n");
-      for (auto &F : *MParts[I]) {
+      LLVM_DEBUG(dbgs() << MPart->getModuleIdentifier() << "  : \n");
+      for (auto &F : *MPart) {
         if (!F.isDeclaration())
           LLVM_DEBUG(dbgs() << "   [Function: ] " << F.getName() << " " << F.getLinkage() << "\n");
       }
@@ -641,14 +654,15 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
       std::lock_guard<std::mutex> lock(mtx);
       LLVM_DEBUG(dbgs() << "partition "<< I  << "  : " << Elapsed.count() << " ms\n");
     }
+    ModuleCallback(std::move(MPart));
+    });
   }
-
-  for (unsigned I = 0; I < N; ++I)
-    ModuleCallback(std::move(MParts[I]));
+  PartitionThreadPool->wait();
 }
 
-SplitModuleCG::SplitModuleCG(Module &M, unsigned LimitPartition, ThreadPool *PartitionThreadPool)
-    : M(M), CG(M), N(LimitPartition), PartitionThreadPool(PartitionThreadPool) {
+SplitModuleCG::SplitModuleCG(Module &M, const llvm::lto::Config &C,
+                             unsigned LimitPartition, ThreadPool *PartitionThreadPool)
+    : M(M), CG(M), N(LimitPartition), PartitionThreadPool(PartitionThreadPool), C(C) {
   // record origin externals
   auto recordIfExternal = [&](const GlobalValue &GV) {
     if (!GV.hasLocalLinkage())
