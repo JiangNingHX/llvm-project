@@ -573,18 +573,20 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
   SmallString<0> BC;
   raw_svector_ostream BCOS(BC);
   WriteBitcodeToFile(M, BCOS);
-  auto SharedBC = std::make_shared<std::string>(BC.str().str());
+  // auto SharedBC = std::make_shared<std::string>(BC.str().str());
+  Expected<BitcodeModule> BMOrErr = parseBitcodeFileStream(MemoryBufferRef(BC.str(), "ld-temp.o"));
+  if (!BMOrErr)
+    report_fatal_error("Failed to read bitcode");
+  BitcodeModule BM = std::move(BMOrErr.get());
   for (unsigned I = 0; I < N; ++I) {
     auto TimeStart = Clock::now();
-    PartitionThreadPool->async([&, I, SharedBC]() {
+    PartitionThreadPool->async([&, I]() {
       const auto &FnsInPart = Partitions[I];
 
       std::unique_ptr<Module> MPart;
       llvm::lto::LTOLLVMContext Ctx(C);
       {
-        Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(
-                  MemoryBufferRef(*SharedBC, "ld-temp.o"),
-                  Ctx);
+        Expected<std::unique_ptr<Module>> MOrErr = BM.parseModule(Ctx);
         if (!MOrErr)
           report_fatal_error("Failed to read bitcode");
         std::unique_ptr<Module> MInCtx = std::move(MOrErr.get());

@@ -8727,6 +8727,11 @@ llvm::parseBitcodeFile(MemoryBufferRef Buffer, LLVMContext &Context,
   return BM->parseModule(Context, Callbacks);
 }
 
+Expected<BitcodeModule>
+llvm::parseBitcodeFileStream(MemoryBufferRef Buffer) {
+  return getSingleModule(Buffer);
+}
+
 Expected<std::string> llvm::getBitcodeTargetTriple(MemoryBufferRef Buffer) {
   Expected<BitstreamCursor> StreamOrErr = initStream(Buffer);
   if (!StreamOrErr)
