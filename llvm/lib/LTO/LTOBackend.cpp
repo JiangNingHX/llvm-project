@@ -151,7 +151,8 @@ Error Config::addSaveTemps(std::string OutputFileName, bool UseInputModulePath,
       // named from the provided OutputFileName with the Task ID appended.
       if (M.getModuleIdentifier() == "ld-temp.o" || !UseInputModulePath) {
         PathPrefix = OutputFileName;
-        PathPrefix += extract_filename(M.getSourceFileName()) + ".";
+        if (ThinLTOSplit)
+          PathPrefix += extract_filename(M.getSourceFileName()) + ".";
         if (Task != (unsigned)-1)
           PathPrefix += utostr(Task) + ".";
       } else
