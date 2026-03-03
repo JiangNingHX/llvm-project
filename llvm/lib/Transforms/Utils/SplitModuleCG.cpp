@@ -713,6 +713,29 @@ void SimplifyCallGraph::createSimplifyCallGraph() {
       continue;
 
     SimplifyCallGraphNode *SCGNode = getOrInsertFunction(F);
+    // deal with indirect call
+    if (F->hasAddressTaken()) {
+      for (auto *User : F->users()) {
+        Instruction *CallInst = nullptr;
+        if (auto *Inst = dyn_cast<Instruction>(User)) {
+          CallInst = Inst;
+        } else if (auto *CE = dyn_cast<ConstantExpr>(User)) {
+          for (auto *CEUser : CE->users()) {
+            if (auto *CEInst = dyn_cast<Instruction>(CEUser)) {
+              CallInst = CEInst;
+              break;
+            }
+          }
+        }
+        if (CallInst) {
+          auto ParentFunc = CallInst->getFunction();
+          if (ParentFunc && ParentFunc != F) {
+            SimplifyCallGraphNode *ParentSCGNode = getOrInsertFunction(ParentFunc);
+            ParentSCGNode->addCalledFunction(SCGNode);
+          }
+        }
+      }
+    }
     for (const auto &CGNodeItem : *CGNode) {
       Function *Called = CGNodeItem.second->getFunction();
       if (!Called) {
