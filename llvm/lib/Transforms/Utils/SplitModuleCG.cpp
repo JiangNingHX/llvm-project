@@ -57,7 +57,7 @@ static cl::opt<float> LargeFnOverlapForMerge(
         "is needed to put them in the same partition"));
 
 static cl::opt<bool> enableSplitCallGraph(
-    "enable-split-callgraph", cl::Hidden, cl::init(true),
+    "enable-split-callgraph", cl::Hidden, cl::init(false),
     cl::desc("Control split to how many partitions in thinlto backend."));
 
 static cl::opt<bool> enablePrintSimplifyCallGraph(
@@ -79,7 +79,7 @@ static cl::opt<float> CGSizeFactor(
              "exceeds the average cost of a partition by this factor; e;g. 3.0"));
 
 static cl::opt<int> SplitCGFunctionSizeThreshold(
-    "split-function-size-threshold", cl::Hidden, cl::init(500),
+    "split-function-size-threshold", cl::Hidden, cl::init(0),
     cl::desc("split the large function from the callgraph as the new root;"
              "e.g. the codesize of function over the cost of 500."));
 
