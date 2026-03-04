@@ -84,7 +84,7 @@ public:
   void createSimplifyCallGraph(const ModuleSummaryIndex &CombinedIndex);
   void print();
   SimplifyCallGraphNode *getOrInsertFunction(const Function *F);
-
+  void traceIndirectCallUsage(Value *V, Function *F, SimplifyCallGraphNode *SCGNode, int Depth);
 private:
   CallGraph &CG;
   Module &M;
@@ -115,6 +115,7 @@ public:
   inline iterator end() { return CalledFunctions.end(); }
   inline const_iterator begin() const { return CalledFunctions.begin(); }
   inline const_iterator end() const { return CalledFunctions.end(); }
+  inline size_t count(SimplifyCallGraphNode * SCGNode) { return CalledFunctions.count(SCGNode); }
   inline bool empty() const { return CalledFunctions.empty(); }
   inline unsigned size() const { return (unsigned)CalledFunctions.size(); }
 

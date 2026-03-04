@@ -598,10 +598,11 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
       // If this function is not part of any kernel's dependencies and isn't
       // directly called, consider it as a root.
       if (!F.isDeclaration() && !SeenFunctions.count(&F)) {
-        {
-          std::lock_guard<std::mutex> lock(mtx);
-          LLVM_DEBUG(dbgs() << "!!!! lost function!!!! " << F.getName() << "\n");
-        }
+        WorkList.emplace_back(*SCG, FuncsCosts, &F, AliasesFuncs, externalFunction,
+                              IfuncFuncs, ComdatFuncs);
+        auto &FWD = WorkList.back();
+        SeenFunctions.insert(FWD.F);
+        SeenFunctions.insert(FWD.Dependencies.begin(), FWD.Dependencies.end());
       }
     }
   }
@@ -782,6 +783,30 @@ SplitModuleCG::SplitModuleCG(Module &M, const llvm::lto::Config &C,
   N = N == 0 ? 1 : N;
 }
 
+void SimplifyCallGraph::traceIndirectCallUsage(Value *V, Function *F, SimplifyCallGraphNode *SCGNode, int Depth) {
+  if (Depth > 5) {
+    return;
+  }
+  for (auto *User : V->users()) {
+    if (auto *I = dyn_cast<Instruction>(User)) {
+      Function *ParentFunc = I->getFunction();
+      if (ParentFunc && ParentFunc != F) {
+        getOrInsertFunction(ParentFunc)->addCalledFunction(SCGNode);
+      }
+    }
+    else if (auto *C = dyn_cast<Constant>(User)) {
+      if (isa<GlobalAlias>(C)) {
+        continue;
+      }
+      if (auto *GV = dyn_cast<GlobalVariable>(C)) {
+        traceIndirectCallUsage(GV, F, SCGNode, Depth + 1);
+      } else {
+        traceIndirectCallUsage(C, F, SCGNode, Depth + 1);
+      }
+    }
+  }
+}
+
 void SimplifyCallGraph::createSimplifyCallGraph(const ModuleSummaryIndex &CombinedIndex) {
   DenseMap<uint64_t, const Function *> GUIDFuntionMap;
   for (auto &F : M.functions()) {
@@ -795,6 +820,9 @@ void SimplifyCallGraph::createSimplifyCallGraph(const ModuleSummaryIndex &Combin
       continue;
 
     SimplifyCallGraphNode *SCGNode = getOrInsertFunction(F);
+    if (F->hasAddressTaken()) {
+      traceIndirectCallUsage(F, F, SCGNode, 0);
+    }
     for (const auto &CGNodeItem : *CGNode) {
       Function *Called = CGNodeItem.second->getFunction();
       if (!Called) {
