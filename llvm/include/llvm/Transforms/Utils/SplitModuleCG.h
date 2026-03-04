@@ -307,6 +307,7 @@ private:
   bool shouldCloneFunction(const Function *Fn);
   void stripDeclareDebugInfoImpl(Module &Mpart, int I);
   void stripRetainedDebugInfoImpl(Module &Mpart, int I);
+  void DealWithDuplicateDebugInfo(Module &MPart);
 };
 
 } // end namespace llvm

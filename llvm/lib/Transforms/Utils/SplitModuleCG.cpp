@@ -485,6 +485,63 @@ void SplitModuleCG::calculateComdatMembers() {
   }
 }
 
+static void DealWithDeclareDebugInfo(Module &MPart) {
+  for (Function &F : MPart)
+    if (F.isDeclaration())
+      F.setSubprogram(nullptr);
+}
+
+void SplitModuleCG::DealWithDuplicateDebugInfo(Module &MPart) {
+  DebugInfoFinder DIF;
+  DIF.processModule(MPart);
+  std::set<DICompileUnit *> NewCUs;
+  bool Changed = false;
+  for (DICompileUnit *DIC : DIF.compile_units()) {
+    // Deal with duplicate imported entities
+    SmallVector<Metadata *, 4> NewImports;
+    bool ChangedNewImports = false;
+    for (auto *IE : DIC->getImportedEntities()) {
+      if (auto *SP = dyn_cast_or_null<DISubprogram>(IE->getEntity())) {
+        if (!SP->isDefinition() || !MPart.getFunction(SP->getLinkageName())) {
+          ChangedNewImports = true;
+          continue;
+        }
+      }
+      NewImports.emplace_back(IE);
+    }
+    if (ChangedNewImports) {
+      DIC->replaceImportedEntities(MDTuple::get(MPart.getContext(), NewImports));
+      Changed = false;
+    }
+
+    // Deal with duplicate enum type
+    SmallVector<Metadata *, 4> NewEnumTypes;
+    bool ChangedEnumTypes = true;
+    for (auto *ET : DIC->getEnumTypes()) {
+      if (auto *SP = dyn_cast_or_null<DISubprogram>(ET->getScope())) {
+        Function *F = MPart.getFunction(SP->getLinkageName());
+        if (!F || (F->isDeclaration() && F->use_empty())) {
+          ChangedEnumTypes = true;
+          continue;
+        }
+        NewEnumTypes.emplace_back(ET);
+      }
+    }
+    if (ChangedEnumTypes) {
+      Changed = true;
+      DIC->replaceEnumTypes(MDTuple::get(MPart.getContext(), NewEnumTypes));
+    }
+
+    NewCUs.insert(DIC);
+  }
+  if (Changed) {
+    NamedMDNode *NMD = MPart.getOrInsertNamedMetadata("llvm.dbg.cu");
+    NMD->clearOperands();
+    for (DICompileUnit *CU : NewCUs)
+      NMD->addOperand(CU);
+  }
+}
+
 using Clock = std::chrono::high_resolution_clock;
 using Ms = std::chrono::milliseconds;
 
@@ -605,42 +662,45 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
           report_fatal_error("Failed to read bitcode");
         std::unique_ptr<Module> MInCtx = std::move(MOrErr.get());
         ValueToValueMapTy VMap;
-        MPart =
-          CloneModule(*MInCtx, VMap, [&](const GlobalValue *GV) {
-            // Functions go in their assigned partition.
-            if (const auto *newFn = dyn_cast<Function>(GV)) {
-              const auto *Fn = M.getFunction(newFn->getName());
-              return FnsInPart.contains(Fn);
-	    }
+        MPart = CloneModule(*MInCtx, VMap, [&](const GlobalValue *GV) {
+          // Functions go in their assigned partition.
+          if (const auto *newFn = dyn_cast<Function>(GV)) {
+            const auto *Fn = M.getFunction(newFn->getName());
+            return FnsInPart.contains(Fn);
+          }
 
-            if (NeedsConservativeImport(GV))
-              return true;
+          if (NeedsConservativeImport(GV))
+            return true;
 
-            // Everything else goes in the first partition.
-            return I == 0;
-          });
+          // Everything else goes in the first partition.
+          return I == 0;
+        });
       }
 
-    // collect symbols to rename
-    auto checkPromoted = [&](const GlobalValue &GV) {
-      // now is external (not local), but not in external set.
-      if ((!GV.hasLocalLinkage() || ChangeLinkageFuncs.count(GV.getName())) && !OriginalExternals.contains(GV.getName())) {
-        std::lock_guard<std::mutex> lock(mtx);
-        if (PromotedRenames.count(GV.getName()))
-          return;
-        std::string NewName =	 
-             GV.getName().str() + "_" + M.getModuleIdentifier();	 
-         PromotedRenames[GV.getName()] = NewName;
-      }
-    };
-    for (const auto &GV : MPart->global_values())
-      checkPromoted(GV);
+      DealWithDuplicateDebugInfo(*MPart);
+      DealWithDeclareDebugInfo(*MPart);
 
-    // Clean-up conservatively imported GVs without any users.
-    for (auto &GV : make_early_inc_range(MPart->globals())) {
-      if (NeedsConservativeImport(&GV) && GV.use_empty())
-        GV.eraseFromParent();
-    }
+      // collect symbols to rename
+      auto checkPromoted = [&](const GlobalValue &GV) {
+        // now is external (not local), but not in external set.
+        if ((!GV.hasLocalLinkage() || ChangeLinkageFuncs.count(GV.getName())) &&
+            !OriginalExternals.contains(GV.getName())) {
+          std::lock_guard<std::mutex> lock(mtx);
+          if (PromotedRenames.count(GV.getName()))
+            return;
+          std::string NewName =
+              GV.getName().str() + "_" + M.getModuleIdentifier();
+          PromotedRenames[GV.getName()] = NewName;
+        }
+      };
+      for (const auto &GV : MPart->global_values())
+        checkPromoted(GV);
+
+      // Clean-up conservatively imported GVs without any users.
+      for (auto &GV : make_early_inc_range(MPart->globals())) {
+        if (NeedsConservativeImport(&GV) && GV.use_empty())
+          GV.eraseFromParent();
+      }
 
     for (auto &func : MPart->functions()) {
       auto Fn = M.getFunction(func.getName());
