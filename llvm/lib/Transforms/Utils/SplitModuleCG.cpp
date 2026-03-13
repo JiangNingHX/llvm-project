@@ -2,6 +2,19 @@
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
+<<<<<<< HEAD
+=======
+#include "llvm/Analysis/CGSCCPassManager.h"
+#include "llvm/Analysis/CallGraphSCCPass.h"
+#include "llvm/Analysis/IndirectCallPromotionAnalysis.h"
+#include "llvm/Analysis/LoopAnalysisManager.h"
+#include "llvm/Analysis/ProfileSummaryInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/Function.h"
+>>>>>>> 06fd8fbffd98... [SplitModule] Deal with indirect call with profile data
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
@@ -737,8 +750,11 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
 }
 
 SplitModuleCG::SplitModuleCG(Module &M, const llvm::lto::Config &C,
-                             unsigned LimitPartition, ThreadPool *PartitionThreadPool)
-    : M(M), CG(M), N(LimitPartition), PartitionThreadPool(PartitionThreadPool), C(C) {
+                             const ModuleSummaryIndex &CombinedIndex,
+                             unsigned LimitPartition,
+                             ThreadPool *PartitionThreadPool)
+    : M(M), CG(M), N(LimitPartition), PartitionThreadPool(PartitionThreadPool),
+      C(C) {
   // record origin externals
   auto recordIfExternal = [&](const GlobalValue &GV) {
     if (!GV.hasLocalLinkage())
@@ -757,7 +773,8 @@ SplitModuleCG::SplitModuleCG(Module &M, const llvm::lto::Config &C,
   LLVM_DEBUG(dbgs() << HotFuncs.size() <<" hot functions in module "  << M.getName()<<" \n");
 
 
-  SCG = std::make_unique<SimplifyCallGraph>(CG, LargeFuncs, HotFuncs, AliasesFuncs);
+  SCG = std::make_unique<SimplifyCallGraph>(CG, LargeFuncs, HotFuncs,
+                                            AliasesFuncs, CombinedIndex, M);
   calculateEntryFuncs();
   if (N == 0 || N > EntryFuncs.size()) {
     N = EntryFuncs.size();
@@ -765,7 +782,12 @@ SplitModuleCG::SplitModuleCG(Module &M, const llvm::lto::Config &C,
   N = N == 0 ? 1 : N;
 }
 
-void SimplifyCallGraph::createSimplifyCallGraph() {
+void SimplifyCallGraph::createSimplifyCallGraph(const ModuleSummaryIndex &CombinedIndex) {
+  DenseMap<uint64_t, const Function *> GUIDFuntionMap;
+  for (auto &F : M.functions()) {
+    GUIDFuntionMap[F.getGUID()] = &F;
+  }
+  ICallPromotionAnalysis ICallAnalysis;
   for (auto &NodePair : CG) {
     CallGraphNode *CGNode = NodePair.second.get();
     Function *F = CGNode->getFunction();
@@ -773,40 +795,56 @@ void SimplifyCallGraph::createSimplifyCallGraph() {
       continue;
 
     SimplifyCallGraphNode *SCGNode = getOrInsertFunction(F);
-    // deal with indirect call
-    if (F->hasAddressTaken()) {
-      for (auto *User : F->users()) {
-        Instruction *CallInst = nullptr;
-        if (auto *Inst = dyn_cast<Instruction>(User)) {
-          CallInst = Inst;
-        } else if (auto *CE = dyn_cast<ConstantExpr>(User)) {
-          for (auto *CEUser : CE->users()) {
-            if (auto *CEInst = dyn_cast<Instruction>(CEUser)) {
-              CallInst = CEInst;
-              break;
-            }
-          }
-        }
-        if (CallInst) {
-          auto ParentFunc = CallInst->getFunction();
-          if (ParentFunc && ParentFunc != F) {
-            SimplifyCallGraphNode *ParentSCGNode = getOrInsertFunction(ParentFunc);
-            ParentSCGNode->addCalledFunction(SCGNode);
-          }
-        }
-      }
-    }
     for (const auto &CGNodeItem : *CGNode) {
       Function *Called = CGNodeItem.second->getFunction();
       if (!Called) {
-        // deal with alias
-        auto *CallInst = cast<CallBase>(*CGNodeItem.first);
-        if (CallInst) {
-          llvm::Value *CalledVal = CallInst->getCalledOperand();
-          if (llvm::isa<llvm::GlobalAlias>(CalledVal)) {
-            AliasesFuncs.insert(F);
+        // indirect call
+        auto *I = cast<Instruction>(*CGNodeItem.first);
+        auto *CB = cast<CallBase>(I);
+        auto *CalledValue = CB->getCalledOperand();
+        auto *CalledFunction = CB->getCalledFunction();
+        if (CalledValue && !CalledFunction) {
+          CalledValue = CalledValue->stripPointerCasts();
+          // Stripping pointer casts can reveal a called function.
+          CalledFunction = dyn_cast<Function>(CalledValue);
+        }
+        // Check if this is an alias to a function.
+        if (auto *GA = dyn_cast<GlobalAlias>(CalledValue)) {
+          AliasesFuncs.insert(F);
+          continue;
+        }
+        // Check if this is an indirect call with profile data.
+        if (!CalledFunction) {
+          const auto *CI = dyn_cast<CallInst>(I);
+          if (CI && CI->isInlineAsm())
+            continue;
+          if (!CalledValue || isa<Constant>(CalledValue))
+            continue;
+          if (auto *MD = I->getMetadata(LLVMContext::MD_callees)) {
+            for (const auto &Op : MD->operands()) {
+              Function *Callee = mdconst::extract_or_null<Function>(Op);
+              if (Callee)
+                SCGNode->addCalledFunction(getOrInsertFunction(Callee));
+            }
+          }
+          uint32_t NumVals, NumCandidates;
+          uint64_t TotalCount;
+          auto CandidateProfileData =
+              ICallAnalysis.getPromotionCandidatesForInstruction(
+                   I, NumVals, TotalCount, NumCandidates);
+          for (const auto &Candidate : CandidateProfileData) {
+            ValueInfo VI = CombinedIndex.getValueInfo(Candidate.Value);
+            const Function *Callee = GUIDFuntionMap[Candidate.Value];
+            LLVM_DEBUG(dbgs() << "Add called function by Profile: '"
+                                << F->getName() << "'  Calls  '"
+                                << Candidate.Value << "'\n");
+            if (Callee) {
+              SCGNode->addCalledFunction(getOrInsertFunction(Callee));
+              LLVM_DEBUG(dbgs() << "    name: "  << Callee->getName() << "\n");
+            }
           }
         }
+        Called = CalledFunction;
       }
       if (!Called || Called->isDeclaration() ||
           (LargeFuncs.find(Called) != LargeFuncs.end() && ( (HotFuncs.find(Called) == HotFuncs.end()) || !SplitBasedHotFuncs) &&
@@ -819,6 +857,7 @@ void SimplifyCallGraph::createSimplifyCallGraph() {
   if (enablePrintSimplifyCallGraph)
     print();
 }
+
 
 void SimplifyCallGraph::print() {
   {

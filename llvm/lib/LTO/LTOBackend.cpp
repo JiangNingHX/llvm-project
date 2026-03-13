@@ -698,8 +698,8 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
   static std::mutex ChangeLinkageMutex;
   auto Mname = Mod.getModuleIdentifier();
 
-  SplitModuleCG SplitModuleCG(Mod, C,
-                              ParallelCodeGenParallelismLevel, PartitionThreadPool);
+  SplitModuleCG SplitModuleCG(Mod, C, CombinedIndex, ParallelCodeGenParallelismLevel,
+                              PartitionThreadPool);
   if (ThinLTOUseCG)
     ParallelCodeGenParallelismLevel = SplitModuleCG.getPartitionNum();
 

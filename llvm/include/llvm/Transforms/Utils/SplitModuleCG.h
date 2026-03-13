@@ -7,6 +7,8 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CallGraph.h"
+#include "llvm/Analysis/InlineCost.h"
+#include "llvm/Analysis/ModuleSummaryAnalysis.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/InlineCost.h"
@@ -30,12 +32,15 @@ class SimplifyCallGraph {
   FunctionMapTy FunctionMap;
 
 public:
-  explicit SimplifyCallGraph (CallGraph &CG,
-                              DenseSet<const Function *> &LargeFuncs,
-                              DenseSet<const Function *> &HotFuncs,
-                              DenseSet<const Function *> &AliasesFuncs)
-         : CG(CG), LargeFuncs(LargeFuncs), HotFuncs(HotFuncs), AliasesFuncs(AliasesFuncs) {
-    createSimplifyCallGraph();
+  explicit SimplifyCallGraph(CallGraph &CG,
+                             DenseSet<const Function *> &LargeFuncs,
+                             DenseSet<const Function *> &HotFuncs,
+                             DenseSet<const Function *> &AliasesFuncs,
+                             const ModuleSummaryIndex &CombinedIndex,
+                             Module &M)
+      : CG(CG), LargeFuncs(LargeFuncs), HotFuncs(HotFuncs),
+        AliasesFuncs(AliasesFuncs), M(M) {
+    createSimplifyCallGraph(CombinedIndex);
   }
   ~SimplifyCallGraph() {};
 
@@ -76,12 +81,13 @@ public:
     return I->second.get();
   }
 
-  void createSimplifyCallGraph();
+  void createSimplifyCallGraph(const ModuleSummaryIndex &CombinedIndex);
   void print();
   SimplifyCallGraphNode *getOrInsertFunction(const Function *F);
 
 private:
   CallGraph &CG;
+  Module &M;
   DenseSet<const Function *> &LargeFuncs;
   DenseSet<const Function *> &HotFuncs;
   DenseSet<const Function *> &AliasesFuncs;
@@ -260,7 +266,9 @@ public:
   using ModuleCreationCallback =
       function_ref<void(std::unique_ptr<Module> MPart)>;
   SplitModuleCG(Module &M, const llvm::lto::Config &C,
-                unsigned LimitPartition = 0, ThreadPool *PartitionThreadPool = nullptr);
+                const ModuleSummaryIndex &CombinedIndex,
+                unsigned LimitPartition = 0,
+                ThreadPool *PartitionThreadPool = nullptr);
   void SplitModule(TargetMachine *TM, ModuleCreationCallback ModuleCallback,
       bool PreserveLocals);
 
