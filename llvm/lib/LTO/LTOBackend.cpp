@@ -91,7 +91,42 @@ struct ForwardingDiagHandler : public DiagnosticHandler {
   }
 
   bool handleDiagnostics(const DiagnosticInfo &DI) override {
-    if (!OrigHandler) { return false; }
+    if (!OrigHandler) { 
+        return false; 
+    }
+    if (DI.getSeverity() == DS_Error) {
+        std::lock_guard<std::mutex> Lock(ForwardDiagMutex);
+        return OrigHandler->handleDiagnostics(DI);
+    }
+    
+    if (DI.getSeverity() != DS_Remark) {
+        return true; 
+    }
+
+    if (const auto *OptDiag = dyn_cast<DiagnosticInfoOptimizationBase>(&DI)) {
+        StringRef PassName = OptDiag->getPassName();
+        if (isa<OptimizationRemarkAnalysis>(&DI)) {
+            if (!OrigHandler->isAnalysisRemarkEnabled(PassName)) {
+                return true; 
+            }
+        } 
+        else if (isa<OptimizationRemark>(&DI)) {
+            if (!OrigHandler->isPassedOptRemarkEnabled(PassName)) {
+                return true;
+            }
+        } 
+        else if (isa<OptimizationRemarkMissed>(&DI)) {
+            if (!OrigHandler->isMissedOptRemarkEnabled(PassName)) {
+                return true;
+            }
+        }
+        else {
+            if (!OrigHandler->isAnalysisRemarkEnabled(PassName)) {
+                return true;
+            }
+        }
+    }
+  
     std::lock_guard<std::mutex> Lock(ForwardDiagMutex);
     return OrigHandler->handleDiagnostics(DI);
   }
