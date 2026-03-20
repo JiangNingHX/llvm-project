@@ -561,12 +561,11 @@ using Ms = std::chrono::milliseconds;
 void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback ModuleCallback,
     bool PreserveLocals) {
   for (Function &F : M) {
-    if (!F.hasAddressTaken()) {
-      ChangeLinkageFuncs[F.getName()] = false;
-    } else {
-      externalize(&F);
-    }
-    if (!F.isDeclaration() && (F.hasExternalLinkage() || !F.isDefinitionExact()))
+    if (F.hasLocalLinkage() && F.hasOneUse() && !F.hasAddressTaken())
+      continue;
+    externalize(&F);
+    if (!F.isDeclaration() &&
+        (F.hasExternalLinkage() || !F.isDefinitionExact()))
       externalFunction[&F] = true;
   }
   for (GlobalVariable &GV : M.globals())
@@ -697,8 +696,7 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
       // collect symbols to rename
       auto checkPromoted = [&](const GlobalValue &GV) {
         // now is external (not local), but not in external set.
-        if ((!GV.hasLocalLinkage() || ChangeLinkageFuncs.count(GV.getName())) &&
-            !OriginalExternals.contains(GV.getName())) {
+        if (!GV.hasLocalLinkage() && !OriginalExternals.contains(GV.getName())) {
           std::lock_guard<std::mutex> lock(mtx);
           if (PromotedRenames.count(GV.getName()))
             return;

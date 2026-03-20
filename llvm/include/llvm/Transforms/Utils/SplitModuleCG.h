@@ -276,10 +276,8 @@ public:
   unsigned getPartitionNum() { return N; }
   StringSet<> &getOriginalExternals() { return OriginalExternals; }
   StringMap<std::string> &getPromotedRenames() { return PromotedRenames; }
+  DenseSet<const Function *> &getIfuncFuncs() { return IfuncFuncs; }
 
-  DenseMap<StringRef, bool> &getChangeLinkageFunction() {return ChangeLinkageFuncs;}
-  DenseSet<const Function *> &getIfuncFuncs() {return IfuncFuncs;}
-  
 private:
   unsigned N;
   Module &M;
@@ -295,7 +293,6 @@ private:
   DenseSet<const Function *> IfuncFuncs;
   DenseSet<const Function *> ComdatFuncs;
   DenseSet<const Function *> IndirectCalleeFuncs;
-  DenseMap<StringRef, bool> ChangeLinkageFuncs;
   StringSet<> OriginalExternals;
   StringMap<std::string> PromotedRenames;
   DenseMap<const Function *, bool> externalFunction;
