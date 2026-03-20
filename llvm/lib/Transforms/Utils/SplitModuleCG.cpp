@@ -2,8 +2,6 @@
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
-<<<<<<< HEAD
-=======
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/CallGraphSCCPass.h"
 #include "llvm/Analysis/IndirectCallPromotionAnalysis.h"
@@ -14,7 +12,6 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/Function.h"
->>>>>>> 06fd8fbffd98... [SplitModule] Deal with indirect call with profile data
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
@@ -154,6 +151,23 @@ static float calculateOverlap(const DenseSet<const Function *> &A,
   }
 
   return static_cast<float>(NumCommon) / Total.size();
+}
+
+static std::vector<DenseSet<const GlobalVariable *>>
+doGVPartitioning(
+    const DenseMap<const Function *, DenseSet<const GlobalVariable *>> &VTableRecord,
+    const std::vector<DenseSet<const Function *>> &Partitions,
+    unsigned NumParts) {
+  std::vector<DenseSet<const GlobalVariable * >> GVPartitions;
+  GVPartitions.resize(NumParts);
+  for (int i = 0; i < Partitions.size(); ++i) {
+    for (const auto *F : Partitions[i]) {
+      auto UsageGVs = VTableRecord.find(F);
+      if (UsageGVs != VTableRecord.end())
+        GVPartitions[i].insert(UsageGVs->second.begin(), UsageGVs->second.end());
+    }
+  }
+  return GVPartitions;
 }
 
 /// Performs all of the partitioning work on \p M.
@@ -555,6 +569,58 @@ void SplitModuleCG::DealWithDuplicateDebugInfo(Module &MPart) {
   }
 }
 
+static void processVTableElements(llvm::GlobalVariable *VTable) {
+  if (!VTable->hasInitializer())
+    return;
+  llvm::Constant *OldInit = VTable->getInitializer();
+  llvm::Constant *OldArray = OldInit->getAggregateElement(0u);
+  llvm::ConstantArray *Array = dyn_cast_or_null<ConstantArray>(OldArray);
+  if (!Array)
+    return;
+  
+  bool Changed = false;
+  std::vector<llvm::Constant *> NewElements;
+  unsigned NumOperands = Array->getNumOperands();
+
+  for (unsigned i = 0; i < NumOperands; ++i) {
+    llvm::Constant *Element = Array->getOperand(i);
+    llvm::Value *Stripped = Element->stripPointerCasts();
+    
+    while (auto *Alias = llvm::dyn_cast<GlobalAlias>(Stripped)) {
+      Stripped = Alias->getAliasee()->stripPointerCasts();
+    }
+
+    if (auto *Func = llvm::dyn_cast<Function>(Stripped)) {
+      llvm::Constant *Replacement = 
+           llvm::ConstantExpr::getBitCast(Func, Element->getType());
+      if (Replacement != Element) {
+        NewElements.push_back(Replacement);
+        Changed = true;
+      } else {
+        NewElements.push_back(Element);
+      }
+    } else {
+      NewElements.push_back(Element);
+    }
+  }
+  if (Changed) {
+    llvm::ArrayType *ATy = Array->getType();
+    llvm::Constant *NewArray = llvm::ConstantArray::get(ATy, NewElements);
+    if (auto *OldStruct = dyn_cast<llvm::ConstantStruct>(OldInit)) {
+      std::vector<llvm::Constant *> StructElts;
+      StructElts.push_back(NewArray);
+      for (unsigned i = 1; i < OldStruct->getType()->getNumElements(); ++i) {
+        StructElts.push_back(OldStruct->getOperand(i));
+      }
+      llvm::Constant *NewStruct =
+           llvm::ConstantStruct::get(OldStruct->getType(), StructElts);
+      VTable->setInitializer(NewStruct);
+    } else {
+      VTable->setInitializer(NewArray);
+    }
+  }
+}
+
 using Clock = std::chrono::high_resolution_clock;
 using Ms = std::chrono::milliseconds;
 
@@ -633,6 +699,17 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
 
   auto Partitions = doPartitioning(M, N, ModuleCost, FuncsCosts, WorkList, EntryFuncs);
   assert(Partitions.size() == N);
+  auto &VTableRecord = SCG->getVTableRecord();
+  auto GVPartitions = doGVPartitioning(VTableRecord, Partitions, N);
+  for (auto GVs : GVPartitions) {
+    for (const auto *GV : GVs) {
+      if (!GV->isDeclaration() && GV->hasExternalLinkage())
+        ExternalGVs[GV] = true;
+    }
+  }
+  for (auto GVsItem : ExternalGVs) {
+    processVTableElements(M.getGlobalVariable(GVsItem.first->getName()));
+  }
 
   // If we didn't externalize GVs, then local GVs need to be conservatively
   // imported into [dependency]every module (including their initializers), and then cleaned
@@ -682,6 +759,14 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
             return FnsInPart.contains(Fn);
           }
 
+          // Global variables go in their assigned partition.
+          if (const auto *newGV = dyn_cast<GlobalVariable>(GV)) {
+            const auto *GVinM = M.getGlobalVariable(newGV->getName());
+            if (GVPartitions[I].contains(GVinM))
+              return true;
+          }
+
+
           if (NeedsConservativeImport(GV))
             return true;
 
@@ -714,35 +799,51 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
           GV.eraseFromParent();
       }
 
-    for (auto &func : MPart->functions()) {
-      auto Fn = M.getFunction(func.getName());
-      std::lock_guard<std::mutex> lock(mtx);
-      if (externalFunction.count(Fn) && !func.isDeclaration() && (HotFuncs.count(Fn) || !CloneHotExternalOnly) && !IfuncFuncs.count(Fn)) {
-        if (!externalFunction[Fn]) {
-          func.setLinkage(GlobalValue::AvailableExternallyLinkage);
-          func.setSubprogram(nullptr);
-          func.setComdat(nullptr);
-        } else {
-          externalFunction[Fn] = false;
+      for (auto &func : MPart->functions()) {
+        auto Fn = M.getFunction(func.getName());
+        std::lock_guard<std::mutex> lock(mtx);
+        if (externalFunction.count(Fn) && !func.isDeclaration() && (HotFuncs.count(Fn) || !CloneHotExternalOnly) && !IfuncFuncs.count(Fn)) {
+          if (!externalFunction[Fn]) {
+            func.setLinkage(GlobalValue::AvailableExternallyLinkage);
+            func.setSubprogram(nullptr);
+            func.setComdat(nullptr);
+          } else {
+            externalFunction[Fn] = false;
+          }
         }
       }
-    }
 
-    {
-      std::lock_guard<std::mutex> lock(mtx);
-      LLVM_DEBUG(dbgs() << MPart->getModuleIdentifier() << "  : \n");
-      for (auto &F : *MPart) {
-        if (!F.isDeclaration())
-          LLVM_DEBUG(dbgs() << "   [Function: ] " << F.getName() << " " << F.getLinkage() << "\n");
+      // externalize GVs
+      for (auto &GV : MPart->globals()) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto GVinM = M.getGlobalVariable(GV.getName());
+        if (ExternalGVs.count(GVinM) && !GV.isDeclaration()) {
+          if (!ExternalGVs[GVinM]) {
+            GV.setLinkage(GlobalValue::AvailableExternallyLinkage);
+            GV.setComdat(nullptr);
+          } else {
+            ExternalGVs[GVinM] = false;
+          }
+        }
       }
-    }
-   auto TimeEnd = Clock::now();
-    auto Elapsed = std::chrono::duration_cast<Ms>(TimeEnd - TimeStart);
-    {
-      std::lock_guard<std::mutex> lock(mtx);
-      LLVM_DEBUG(dbgs() << "partition "<< I  << "  : " << Elapsed.count() << " ms\n");
-    }
-    ModuleCallback(std::move(MPart));
+
+      {
+        std::lock_guard<std::mutex> lock(mtx);
+        LLVM_DEBUG(dbgs() << MPart->getModuleIdentifier() << "  : \n");
+        for (auto &F : *MPart) {
+          if (!F.isDeclaration())
+            LLVM_DEBUG(dbgs() << "   [Function: ] " << I << "  " << F.getName() << " "
+                              << F.getLinkage() << "\n");
+        }
+      }
+      auto TimeEnd = Clock::now();
+      auto Elapsed = std::chrono::duration_cast<Ms>(TimeEnd - TimeStart);
+      {
+        std::lock_guard<std::mutex> lock(mtx);
+        LLVM_DEBUG(dbgs() << "partition " << I << "  : " << Elapsed.count()
+                          << " ms\n");
+      }
+      ModuleCallback(std::move(MPart));
     });
   }
   PartitionThreadPool->wait();
@@ -781,6 +882,17 @@ SplitModuleCG::SplitModuleCG(Module &M, const llvm::lto::Config &C,
   N = N == 0 ? 1 : N;
 }
 
+static bool isVTable(const GlobalVariable *GV) {
+  if (GV->getMetadata(llvm::LLVMContext::MD_type))
+    return true;
+  
+  llvm::StringRef Name = GV->getName();
+  if (Name.startswith("_ZTV"))
+    return true;
+
+  return false;
+}
+
 void SimplifyCallGraph::traceIndirectCallUsage(Value *V, Function *F, SimplifyCallGraphNode *SCGNode, int Depth) {
   if (Depth > 5) {
     return;
@@ -797,6 +909,8 @@ void SimplifyCallGraph::traceIndirectCallUsage(Value *V, Function *F, SimplifyCa
         continue;
       }
       if (auto *GV = dyn_cast<GlobalVariable>(C)) {
+        if (isVTable(GV) || GV->hasAvailableExternallyLinkage())
+          VTableRecord[F].insert(GV);
         traceIndirectCallUsage(GV, F, SCGNode, Depth + 1);
       } else {
         traceIndirectCallUsage(C, F, SCGNode, Depth + 1);

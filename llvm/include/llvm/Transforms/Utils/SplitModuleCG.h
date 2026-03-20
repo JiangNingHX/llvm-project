@@ -85,12 +85,17 @@ public:
   void print();
   SimplifyCallGraphNode *getOrInsertFunction(const Function *F);
   void traceIndirectCallUsage(Value *V, Function *F, SimplifyCallGraphNode *SCGNode, int Depth);
+  DenseMap<const Function *, DenseSet<const GlobalVariable *>> &getVTableRecord() {
+    return VTableRecord;
+  }
+
 private:
   CallGraph &CG;
   Module &M;
   DenseSet<const Function *> &LargeFuncs;
   DenseSet<const Function *> &HotFuncs;
   DenseSet<const Function *> &AliasesFuncs;
+  DenseMap<const Function *, DenseSet<const GlobalVariable *>> VTableRecord;
 };
 
 class SimplifyCallGraphNode {
@@ -296,6 +301,7 @@ private:
   StringSet<> OriginalExternals;
   StringMap<std::string> PromotedRenames;
   DenseMap<const Function *, bool> externalFunction;
+  DenseMap<const GlobalVariable *, bool> ExternalGVs;
   DenseMap<const Function *, CostType> FuncsCosts;
   ThreadPool *PartitionThreadPool;
   const llvm::lto::Config &C;
