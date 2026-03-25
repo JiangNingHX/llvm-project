@@ -712,6 +712,8 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
   DiagnosticHandler *OrigDiagHandler = const_cast<DiagnosticHandler*>(Mod.getContext().getDiagHandlerPtr());
   bool OrigHotness = Mod.getContext().getDiagnosticsHotnessRequested();
 
+  bool GlobalTimeTraceEnabled = llvm::timeTraceProfilerEnabled();
+
   // [Timing] 1.start
   auto TimeStart = Clock::now();
   std::atomic<long> TotalOptTime{0};
@@ -742,6 +744,12 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
 
     MPart->getContext().setDiagnosticHandler(std::make_unique<ForwardingDiagHandler>(OrigDiagHandler));
     MPart->getContext().setDiagnosticsHotnessRequested(OrigHotness);
+
+    bool NeedLocalProfiler = GlobalTimeTraceEnabled && !llvm::timeTraceProfilerEnabled();
+
+    if(NeedLocalProfiler) {
+      llvm::timeTraceProfilerInitialize(0, "Thinlto-BackEnd");
+    }
     
     if (ThinLTODebugMpart) {
       std::lock_guard<std::mutex> Lock(PrintMutex);
@@ -844,6 +852,22 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
       TotalCodeGenTime +=
           std::chrono::duration_cast<Ms>(EndCG - StartCG).count();
     }
+    if (NeedLocalProfiler) {
+      std::string TraceFilename = "thinlto-task" + std::to_string(task) + "-thread-" +std::to_string(CurrentThreadId) + ".json";
+      std::error_code EC;
+      raw_fd_ostream OS(TraceFilename, EC, sys::fs::OF_Text);
+      if(!EC) {
+        llvm::timeTraceProfilerWrite(OS);
+        OS.flush();
+      } else {
+          llvm::errs() << "[TimeTrace] Error writing " << TraceFilename << ":" << EC.message() << "\n";
+      }
+      llvm::timeTraceProfilerCleanup();
+    }
+    // },
+    // Pass BC using std::move to ensure that it get moved rather than
+    // copied into the thread's context.
+    // std::move(BC));
   };
 
   if (ThinLTOUseCG)
