@@ -105,10 +105,12 @@ static cl::opt<bool> CloneHotExternalOnly(
     "clone-hot-external-only", cl::Hidden, cl::init(false),
     cl::desc(""));
 
-
-static cl::opt<bool> BindToNuma(
-    "bind-to-numa", cl::Hidden, cl::init(false),
-    cl::desc("binding to numa before clone module"));
+static cl::opt<bool>
+    BindToNuma("bind-to-numa", cl::Hidden, cl::init(false),
+               cl::desc("binding to numa before clone module"));
+static cl::opt<bool>
+    ParallelCloneModule("parallel-cloneModule", cl::Hidden, cl::init(true),
+               cl::desc("parallel clone module"));
 
 using GetTTIFn = function_ref<const TargetTransformInfo &(Function &)>;
 using PartitionID = unsigned;
@@ -721,112 +723,167 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
     return Var && Var->hasLocalLinkage();
   };
 
-  int MainNuma;
-  if (BindToNuma && numa_available() == 0)
-    MainNuma = numa_node_of_cpu(sched_getcpu());
- 
   unsigned TotalFnImpls = 0;
-  SmallString<0> BC;
-  raw_svector_ostream BCOS(BC);
-  WriteBitcodeToFile(M, BCOS);
-  // auto SharedBC = std::make_shared<std::string>(BC.str().str());
-  Expected<BitcodeModule> BMOrErr = parseBitcodeFileStream(MemoryBufferRef(BC.str(), "ld-temp.o"));
-  if (!BMOrErr)
-    report_fatal_error("Failed to read bitcode");
-  BitcodeModule BM = std::move(BMOrErr.get());
-  for (unsigned I = 0; I < N; ++I) {
-    auto TimeStart = Clock::now();
-    PartitionThreadPool->async([&, I]() {
 
-      if (BindToNuma && numa_available() == 0) {
-        numa_run_on_node(MainNuma);
+  auto dealWithMpart = [&](std::unique_ptr<Module> MPart) {
+    DealWithDuplicateDebugInfo(*MPart);
+    DealWithDeclareDebugInfo(*MPart);
+    // collect symbols to rename
+    auto checkPromoted = [&](const GlobalValue &GV) {
+      // now is external (not local), but not in external set.
+      if (!GV.hasLocalLinkage() && !OriginalExternals.contains(GV.getName())) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (PromotedRenames.count(GV.getName()))
+          return;
+        std::string NewName =
+            GV.getName().str() + "_" + M.getModuleIdentifier();
+        PromotedRenames[GV.getName()] = NewName;
       }
+    };
+    for (const auto &GV : MPart->global_values())
+      checkPromoted(GV);
+    // Clean-up conservatively imported GVs without any users.
+    for (auto &GV : make_early_inc_range(MPart->globals())) {
+      if (NeedsConservativeImport(&GV) && GV.use_empty())
+        GV.eraseFromParent();
+    }
+    for (auto &func : MPart->functions()) {
+      auto Fn = M.getFunction(func.getName());
+      std::lock_guard<std::mutex> lock(mtx);
+      if (externalFunction.count(Fn) && !func.isDeclaration() &&
+          (HotFuncs.count(Fn) || !CloneHotExternalOnly) &&
+          !IfuncFuncs.count(Fn)) {
+        if (!externalFunction[Fn]) {
+          func.setLinkage(GlobalValue::AvailableExternallyLinkage);
+          func.setSubprogram(nullptr);
+          func.setComdat(nullptr);
+        } else {
+          externalFunction[Fn] = false;
+        }
+      }
+    }
+    // externalize GVs
+    for (auto &GV : MPart->globals()) {
+      std::lock_guard<std::mutex> lock(mtx);
+      auto GVinM = M.getGlobalVariable(GV.getName());
+      if (ExternalGVs.count(GVinM) && !GV.isDeclaration()) {
+        if (!ExternalGVs[GVinM]) {
+          GV.setLinkage(GlobalValue::AvailableExternallyLinkage);
+          GV.setComdat(nullptr);
+        } else {
+          ExternalGVs[GVinM] = false;
+        }
+      }
+    }
+    return std::move(MPart);
+  };
 
-      const auto &FnsInPart = Partitions[I];
+  if (ParallelCloneModule) {
+    int MainNuma;
+    if (BindToNuma && numa_available() == 0)
+      MainNuma = numa_node_of_cpu(sched_getcpu());
+    SmallString<0> BC;
+    raw_svector_ostream BCOS(BC);
+    WriteBitcodeToFile(M, BCOS);
+    // auto SharedBC = std::make_shared<std::string>(BC.str().str());
+    Expected<BitcodeModule> BMOrErr =
+        parseBitcodeFileStream(MemoryBufferRef(BC.str(), "ld-temp.o"));
+    if (!BMOrErr)
+      report_fatal_error("Failed to read bitcode");
+    BitcodeModule BM = std::move(BMOrErr.get());
+    for (unsigned I = 0; I < N; ++I) {
+      auto TimeStart = Clock::now();
+      PartitionThreadPool->async([&, I]() {
+        if (BindToNuma && numa_available() == 0) {
+          numa_run_on_node(MainNuma);
+        }
 
-      std::unique_ptr<Module> MPart;
-      llvm::lto::LTOLLVMContext Ctx(C);
-      {
-        Expected<std::unique_ptr<Module>> MOrErr = BM.parseModule(Ctx);
-        if (!MOrErr)
-          report_fatal_error("Failed to read bitcode");
-        std::unique_ptr<Module> MInCtx = std::move(MOrErr.get());
-        ValueToValueMapTy VMap;
-        MPart = CloneModule(*MInCtx, VMap, [&](const GlobalValue *GV) {
-          // Functions go in their assigned partition.
-          if (const auto *newFn = dyn_cast<Function>(GV)) {
-            const auto *Fn = M.getFunction(newFn->getName());
-            return FnsInPart.contains(Fn);
-          }
+        const auto &FnsInPart = Partitions[I];
 
-          // Global variables go in their assigned partition.
-          if (const auto *newGV = dyn_cast<GlobalVariable>(GV)) {
-            const auto *GVinM = M.getGlobalVariable(newGV->getName());
-            if (GVPartitions[I].contains(GVinM))
+        std::unique_ptr<Module> MPart;
+        llvm::lto::LTOLLVMContext Ctx(C);
+        {
+          Expected<std::unique_ptr<Module>> MOrErr = BM.parseModule(Ctx);
+          if (!MOrErr)
+            report_fatal_error("Failed to read bitcode");
+          std::unique_ptr<Module> MInCtx = std::move(MOrErr.get());
+          ValueToValueMapTy VMap;
+          MPart = CloneModule(*MInCtx, VMap, [&](const GlobalValue *GV) {
+            // Functions go in their assigned partition.
+            if (const auto *newFn = dyn_cast<Function>(GV)) {
+              const auto *Fn = M.getFunction(newFn->getName());
+              return FnsInPart.contains(Fn);
+            }
+
+            // Global variables go in their assigned partition.
+            if (const auto *newGV = dyn_cast<GlobalVariable>(GV)) {
+              const auto *GVinM = M.getGlobalVariable(newGV->getName());
+              if (GVPartitions[I].contains(GVinM))
+                return true;
+            }
+
+
+            if (NeedsConservativeImport(GV))
               return true;
-          }
 
+            // Everything else goes in the first partition.
+            return I == 0;
+          });
+        }
 
-          if (NeedsConservativeImport(GV))
-            return true;
+        MPart = dealWithMpart(std::move(MPart));
 
-          // Everything else goes in the first partition.
-          return I == 0;
-        });
-      }
-
-      DealWithDuplicateDebugInfo(*MPart);
-      DealWithDeclareDebugInfo(*MPart);
-
-      // collect symbols to rename
-      auto checkPromoted = [&](const GlobalValue &GV) {
-        // now is external (not local), but not in external set.
-        if (!GV.hasLocalLinkage() && !OriginalExternals.contains(GV.getName())) {
+        {
           std::lock_guard<std::mutex> lock(mtx);
-          if (PromotedRenames.count(GV.getName()))
-            return;
-          std::string NewName =
-              GV.getName().str() + "_" + M.getModuleIdentifier();
-          PromotedRenames[GV.getName()] = NewName;
-        }
-      };
-      for (const auto &GV : MPart->global_values())
-        checkPromoted(GV);
-
-      // Clean-up conservatively imported GVs without any users.
-      for (auto &GV : make_early_inc_range(MPart->globals())) {
-        if (NeedsConservativeImport(&GV) && GV.use_empty())
-          GV.eraseFromParent();
-      }
-
-      for (auto &func : MPart->functions()) {
-        auto Fn = M.getFunction(func.getName());
-        std::lock_guard<std::mutex> lock(mtx);
-        if (externalFunction.count(Fn) && !func.isDeclaration() && (HotFuncs.count(Fn) || !CloneHotExternalOnly) && !IfuncFuncs.count(Fn)) {
-          if (!externalFunction[Fn]) {
-            func.setLinkage(GlobalValue::AvailableExternallyLinkage);
-            func.setSubprogram(nullptr);
-            func.setComdat(nullptr);
-          } else {
-            externalFunction[Fn] = false;
+          LLVM_DEBUG(dbgs() << MPart->getModuleIdentifier() << "  : \n");
+          for (auto &F : *MPart) {
+            if (!F.isDeclaration())
+              LLVM_DEBUG(dbgs() << "   [Function: ] " << I << "  " << F.getName() << " "
+                                << F.getLinkage() << "\n");
           }
         }
-      }
-
-      // externalize GVs
-      for (auto &GV : MPart->globals()) {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto GVinM = M.getGlobalVariable(GV.getName());
-        if (ExternalGVs.count(GVinM) && !GV.isDeclaration()) {
-          if (!ExternalGVs[GVinM]) {
-            GV.setLinkage(GlobalValue::AvailableExternallyLinkage);
-            GV.setComdat(nullptr);
-          } else {
-            ExternalGVs[GVinM] = false;
-          }
+        auto TimeEnd = Clock::now();
+        auto Elapsed = std::chrono::duration_cast<Ms>(TimeEnd - TimeStart);
+        {
+          std::lock_guard<std::mutex> lock(mtx);
+          LLVM_DEBUG(dbgs() << "partition " << I << "  : " << Elapsed.count()
+                            << " ms\n");
         }
-      }
+        ModuleCallback(std::move(MPart));
+      });
+    }
+    PartitionThreadPool->wait();
+  } else {
+    for (unsigned I = 0; I < N; ++I) {
+      const auto &FnsInPart = Partitions[I];
+      auto TimeStart = Clock::now();
+      ValueToValueMapTy VMap;
+      std::unique_ptr<Module> MPart(
+        CloneModule(M, VMap, [&](const GlobalValue *GV) {
+            // Functions go in their assigned partition.
+            if (const auto *newFn = dyn_cast<Function>(GV)) {
+              const auto *Fn = M.getFunction(newFn->getName());
+              return FnsInPart.contains(Fn);
+            }
 
+            // Global variables go in their assigned partition.
+            if (const auto *newGV = dyn_cast<GlobalVariable>(GV)) {
+              const auto *GVinM = M.getGlobalVariable(newGV->getName());
+              if (GVPartitions[I].contains(GVinM))
+                return true;
+            }
+
+
+            if (NeedsConservativeImport(GV))
+              return true;
+
+            // Everything else goes in the first partition.
+            return I == 0;
+          }));
+      
+      
+        MPart = dealWithMpart(std::move(MPart));
+        
       {
         std::lock_guard<std::mutex> lock(mtx);
         LLVM_DEBUG(dbgs() << MPart->getModuleIdentifier() << "  : \n");
@@ -843,10 +900,23 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
         LLVM_DEBUG(dbgs() << "partition " << I << "  : " << Elapsed.count()
                           << " ms\n");
       }
-      ModuleCallback(std::move(MPart));
-    });
+
+      SmallString<0> BC;
+      raw_svector_ostream BCOS(BC);
+      WriteBitcodeToFile(*MPart, BCOS);
+      PartitionThreadPool->async([&, I](const SmallString<0> &BC) {
+        llvm::lto::LTOLLVMContext Ctx(C);
+        Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(	 
+            MemoryBufferRef(BC.str(), "ld-temp.o"),	 
+            Ctx);	 
+        if (!MOrErr)	 
+          report_fatal_error("Failed to read bitcode");	 
+        std::unique_ptr<Module> MPartInCtx = std::move(MOrErr.get());
+        ModuleCallback(std::move(MPartInCtx));
+      }, std::move(BC));
+    }
+    PartitionThreadPool->wait();
   }
-  PartitionThreadPool->wait();
 }
 
 SplitModuleCG::SplitModuleCG(Module &M, const llvm::lto::Config &C,
