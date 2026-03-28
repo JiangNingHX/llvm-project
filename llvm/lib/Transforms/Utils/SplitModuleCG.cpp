@@ -852,7 +852,7 @@ void SplitModuleCG::SplitModule(TargetMachine *TM, ModuleCreationCallback Module
 SplitModuleCG::SplitModuleCG(Module &M, const llvm::lto::Config &C,
                              const ModuleSummaryIndex &CombinedIndex,
                              unsigned LimitPartition,
-                             ThreadPool *PartitionThreadPool)
+                             DefaultThreadPool *PartitionThreadPool)
     : M(M), CG(M), N(LimitPartition), PartitionThreadPool(PartitionThreadPool),
       C(C) {
   // record origin externals
@@ -887,7 +887,7 @@ static bool isVTable(const GlobalVariable *GV) {
     return true;
   
   llvm::StringRef Name = GV->getName();
-  if (Name.startswith("_ZTV"))
+  if (Name.starts_with("_ZTV"))
     return true;
 
   return false;
@@ -967,11 +967,11 @@ void SimplifyCallGraph::createSimplifyCallGraph(const ModuleSummaryIndex &Combin
                 SCGNode->addCalledFunction(getOrInsertFunction(Callee));
             }
           }
-          uint32_t NumVals, NumCandidates;
+          uint32_t NumCandidates;
           uint64_t TotalCount;
           auto CandidateProfileData =
               ICallAnalysis.getPromotionCandidatesForInstruction(
-                   I, NumVals, TotalCount, NumCandidates);
+                   I, TotalCount, NumCandidates);
           for (const auto &Candidate : CandidateProfileData) {
             ValueInfo VI = CombinedIndex.getValueInfo(Candidate.Value);
             const Function *Callee = GUIDFuntionMap[Candidate.Value];

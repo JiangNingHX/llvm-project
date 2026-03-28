@@ -274,7 +274,7 @@ public:
   SplitModuleCG(Module &M, const llvm::lto::Config &C,
                 const ModuleSummaryIndex &CombinedIndex,
                 unsigned LimitPartition = 0,
-                ThreadPool *PartitionThreadPool = nullptr);
+                DefaultThreadPool *PartitionThreadPool = nullptr);
   void SplitModule(TargetMachine *TM, ModuleCreationCallback ModuleCallback,
       bool PreserveLocals);
 
@@ -303,7 +303,7 @@ private:
   DenseMap<const Function *, bool> externalFunction;
   DenseMap<const GlobalVariable *, bool> ExternalGVs;
   DenseMap<const Function *, CostType> FuncsCosts;
-  ThreadPool *PartitionThreadPool;
+  DefaultThreadPool *PartitionThreadPool;
   const llvm::lto::Config &C;
   DenseMap<const Comdat *, DenseSet<const GlobalValue *>> ComdatMembers;
 

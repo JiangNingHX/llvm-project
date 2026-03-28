@@ -152,9 +152,6 @@ static cl::opt<bool> splitOptAndCodeGen(
 static cl::opt<bool> ThinLTOUseCG(
     "thinlto-use-callgraph", cl::init(true),
     cl::desc("use callgraph to split module in thinlto backend."));
-static cl::opt<bool> ThinLTOSplit(
-    "thinlto-split", cl::init(true),
-    cl::desc("split module in thinlto backend."));
 static cl::opt<unsigned> ThinLTOSplitThreshold(
     "thinlto-split-threshold", cl::Hidden, cl::init(2),
     cl::desc("control the amount of whether split in thinlto backend."));
@@ -171,6 +168,7 @@ static cl::opt<bool> ThinLTODebugMpart(
 
 namespace llvm {
 extern cl::opt<bool> NoPGOWarnMismatch;
+extern cl::opt<bool> ThinLTOSplit;
 }
 
 [[noreturn]] static void reportOpenError(StringRef Path, Twine Msg) {
@@ -341,19 +339,23 @@ static void runProfileLoaderPass(const Config &Conf, Module &Mod,
   if (!Conf.SampleProfile.empty())
     PGOOpt = PGOOptions(Conf.SampleProfile, "", Conf.ProfileRemapping,
                         /*MemoryProfile=*/"", FS, PGOOptions::SampleUse,
-                        PGOOptions::NoCSAction, true);
+                        PGOOptions::NoCSAction,
+                        PGOOptions::ColdFuncOpt::Default, true);
   else if (Conf.RunCSIRInstr) {
     PGOOpt = PGOOptions("", Conf.CSIRProfile, Conf.ProfileRemapping,
                         /*MemoryProfile=*/"", FS, PGOOptions::IRUse,
-                        PGOOptions::CSIRInstr, Conf.AddFSDiscriminator);
+                        PGOOptions::CSIRInstr, PGOOptions::ColdFuncOpt::Default,
+                        Conf.AddFSDiscriminator);
   } else if (!Conf.CSIRProfile.empty()) {
     PGOOpt = PGOOptions(Conf.CSIRProfile, "", Conf.ProfileRemapping,
                         /*MemoryProfile=*/"", FS, PGOOptions::IRUse,
-                        PGOOptions::CSIRUse, Conf.AddFSDiscriminator);
+                        PGOOptions::CSIRUse, PGOOptions::ColdFuncOpt::Default,
+                        Conf.AddFSDiscriminator);
     NoPGOWarnMismatch = !Conf.PGOWarnMismatch;
   } else if (Conf.AddFSDiscriminator) {
     PGOOpt = PGOOptions("", "", "", /*MemoryProfile=*/"", nullptr,
-                        PGOOptions::NoAction, PGOOptions::NoCSAction, true);
+                        PGOOptions::NoAction, PGOOptions::NoCSAction,
+                        PGOOptions::ColdFuncOpt::Default, true);
   }
   bool HasSampleProfile = PGOOpt && (PGOOpt->Action == PGOOptions::SampleUse);
   if (!HasSampleProfile)
@@ -705,7 +707,7 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
                                    const ModuleSummaryIndex &CombinedIndex,
                                    const std::vector<uint8_t> &CmdArgs,
                                    DefaultThreadPool *PartitionThreadPool,
-                                   bool DoOpt) {
+                                   bool DoOpt, AddStreamFn IRAddStream) {
   unsigned ThreadCount = 0;
   const Target *T = &TM->getTarget();
 
@@ -791,7 +793,7 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C, TargetMachine
       // running `opt()`. We're not reaching here as it's bailed out earlier
       // with `CodeGenOnly` which has been set in `SecondRoundThinBackend`.
       if (IRAddStream)
-        cgdata::saveModuleForTwoRounds(*MPartInCtx, task + CurrentThreadId, IRAddStream);
+        cgdata::saveModuleForTwoRounds(*MPart, task + CurrentThreadId, IRAddStream);
 
       auto EndOpt = Clock::now();
       if (ThinLTODebugMpart) {
@@ -1183,7 +1185,7 @@ Error lto::thinBackend(const Config &Conf, unsigned Task, AddStreamFn AddStream,
                        MapVector<StringRef, BitcodeModule> *ModuleMap,
                        bool CodeGenOnly, AddStreamFn IRAddStream,
                        const std::vector<uint8_t> &CmdArgs,
-                       ThreadPool *PartitionThreadPool) {
+                       DefaultThreadPool *PartitionThreadPool) {
   Expected<const Target *> TOrErr = initAndLookupTarget(Conf, Mod);
   if (!TOrErr)
     return TOrErr.takeError();
@@ -1209,7 +1211,8 @@ Error lto::thinBackend(const Config &Conf, unsigned Task, AddStreamFn AddStream,
   if (Conf.CodeGenOnly) {
     if (ThinLTOSplit)
       splitOptAndCodeGenThin(Task, Conf, TM.get(), AddStream, ThinLTOSplitPartitions,
-                             Mod, CombinedIndex, CmdArgs, PartitionThreadPool, false);
+                             Mod, CombinedIndex, CmdArgs, PartitionThreadPool,
+                             false, IRAddStream);
     else
       codegen(Conf, TM.get(), AddStream, Task, Mod, CombinedIndex);
     return finalizeOptimizationRemarks(std::move(DiagnosticOutputFile));
@@ -1237,7 +1240,7 @@ Error lto::thinBackend(const Config &Conf, unsigned Task, AddStreamFn AddStream,
           if (splitOptAndCodeGen) {
             if (!splitOptAndCodeGenThin(
                     Task, Conf, TM, AddStream, ThinLTOSplitPartitions, Mod,
-                    CombinedIndex, CmdArgs, PartitionThreadPool, true))
+                    CombinedIndex, CmdArgs, PartitionThreadPool, true, IRAddStream))
               return finalizeOptimizationRemarks(std::move(DiagnosticOutputFile));
           } else {
             if (!opt(Conf, TM, Task, Mod, /*IsThinLTO=*/true,
@@ -1253,7 +1256,8 @@ Error lto::thinBackend(const Config &Conf, unsigned Task, AddStreamFn AddStream,
               cgdata::saveModuleForTwoRounds(Mod, Task, IRAddStream);
 
             splitOptAndCodeGenThin(Task, Conf, TM, AddStream, ThinLTOSplitPartitions,
-                                   Mod, CombinedIndex, CmdArgs, PartitionThreadPool, false);
+                                   Mod, CombinedIndex, CmdArgs, PartitionThreadPool,
+                                   false, IRAddStream);
           }
         } else {
           if (!opt(Conf, TM, Task, Mod, /*IsThinLTO=*/true,
