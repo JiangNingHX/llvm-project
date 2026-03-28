@@ -208,6 +208,7 @@ protected:
   IndexWriteCallback OnWrite;
   bool ShouldEmitImportsFiles;
   DefaultThreadPool BackendThreadPool;
+  DefaultThreadPool PartitionThreadPool;
   std::optional<Error> Err;
   std::mutex ErrMu;
 
@@ -220,7 +221,8 @@ public:
       : Conf(Conf), CombinedIndex(CombinedIndex),
         ModuleToDefinedGVSummaries(ModuleToDefinedGVSummaries),
         OnWrite(OnWrite), ShouldEmitImportsFiles(ShouldEmitImportsFiles),
-        BackendThreadPool(ThinLTOParallelism) {}
+        BackendThreadPool(ThinLTOParallelism),
+        PartitionThreadPool(ThinLTOParallelism) {}
 
   virtual ~ThinBackendProc() = default;
   virtual Error start(

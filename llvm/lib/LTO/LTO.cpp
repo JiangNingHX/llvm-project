@@ -1460,7 +1460,8 @@ public:
 
       return thinBackend(Conf, Task, AddStream, **MOrErr, CombinedIndex,
                          ImportList, DefinedGlobals, &ModuleMap,
-                         Conf.CodeGenOnly);
+                         Conf.CodeGenOnly, /*IRAddStream=*/nullptr,
+                         /*CmdArgs=*/{}, &PartitionThreadPool);
     };
 
     auto ModuleID = BM.getModuleIdentifier();
@@ -1574,7 +1575,8 @@ public:
 
       return thinBackend(Conf, Task, CGAddStream, **MOrErr, CombinedIndex,
                          ImportList, DefinedGlobals, &ModuleMap,
-                         Conf.CodeGenOnly, IRAddStream);
+                         Conf.CodeGenOnly, IRAddStream,
+                         /*CmdArgs=*/{}, &PartitionThreadPool);
     };
 
     auto ModuleID = BM.getModuleIdentifier();
@@ -1668,7 +1670,8 @@ public:
 
       return thinBackend(Conf, Task, AddStream, *LoadedModule, CombinedIndex,
                          ImportList, DefinedGlobals, &ModuleMap,
-                         /*CodeGenOnly=*/true);
+                         /*CodeGenOnly=*/true, /*IRAddStream=*/nullptr,
+                         /*CmdArgs=*/{}, &PartitionThreadPool);
     };
 
     auto ModuleID = BM.getModuleIdentifier();

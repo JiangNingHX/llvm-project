@@ -1489,6 +1489,8 @@ public:
   const_gvsummary_iterator end() const { return GlobalValueMap.end(); }
   size_t size() const { return GlobalValueMap.size(); }
 
+  GlobalValueSummaryMapTy &getGlobalValueMap() { return GlobalValueMap; }
+
   const std::vector<uint64_t> &stackIds() const { return StackIds; }
 
   unsigned addOrGetStackIdIndex(uint64_t StackId) {

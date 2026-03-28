@@ -23,6 +23,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/IPO/FunctionImport.h"
+#include "llvm/Support/ThreadPool.h"
 
 namespace llvm {
 
@@ -55,12 +56,13 @@ Error backend(const Config &C, AddStreamFn AddStream,
 /// \p IRAddStream is not nullptr, it will be called just before code generation
 /// to serialize the optimized IR.
 Error thinBackend(const Config &C, unsigned Task, AddStreamFn AddStream,
-                  Module &M, const ModuleSummaryIndex &CombinedIndex,
+                  Module &M, ModuleSummaryIndex &CombinedIndex,
                   const FunctionImporter::ImportMapTy &ImportList,
                   const GVSummaryMapTy &DefinedGlobals,
                   MapVector<StringRef, BitcodeModule> *ModuleMap,
                   bool CodeGenOnly, AddStreamFn IRAddStream = nullptr,
-                  const std::vector<uint8_t> &CmdArgs = std::vector<uint8_t>());
+                  const std::vector<uint8_t> &CmdArgs = std::vector<uint8_t>(),
+                  DefaultThreadPool *PartitionThreadPool = nullptr);
 
 Error finalizeOptimizationRemarks(
     std::unique_ptr<ToolOutputFile> DiagOutputFile);
