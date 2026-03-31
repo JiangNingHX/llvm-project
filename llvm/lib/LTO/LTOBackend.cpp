@@ -158,7 +158,10 @@ static cl::opt<unsigned> ThinLTOSplitThreshold(
 static cl::opt<unsigned> ThinLTOSplitModuleSizeThreshold(
     "thinlto-split-module-size-threshold", cl::Hidden, cl::init(500),
     cl::desc("Control the amount of whether split in thinlto backend"
-"accroding to the size of a module."));
+             "accroding to the size of a module."));
+static cl::opt<float> ThinLTOSplitModuleSizeRiteThreshold(
+    "thinlto-split-module-size-rite-threshold", cl::Hidden, cl::init(0.6),
+    cl::desc(""));
 static cl::opt<unsigned> ThinLTOSplitPartitions(
     "thinlto-split-partitions", cl::Hidden, cl::init(0),
     cl::desc("control split to how many partitions in thinlto backend."));
@@ -654,6 +657,13 @@ static unsigned calModuleSize(const llvm::Module &M) {
   for (const auto &F : M)
     for (const auto &BB : F)
       size += std::distance(BB.begin(), BB.end());
+  return size;
+}
+
+static unsigned calFunctionSize(const llvm::Function &F) {
+  unsigned size = 0;
+  for (const auto &BB : F)
+    size += std::distance(BB.begin(), BB.end());
   return size;
 }
 
@@ -1178,6 +1188,67 @@ updateIndexSummaryForInternalizeSymbol(ModuleSummaryIndex &CombinedIndex,
   }
 }
 
+static bool HasLargeCG(Module &Mod, const ModuleSummaryIndex &CombinedIndex) {
+  llvm::CallGraph CG(Mod);
+  DenseSet<const Function *> LargeFuncs, HotFuncs, AliasesFuncs;
+  llvm::SimplifyCallGraph SCG(CG, LargeFuncs, HotFuncs, AliasesFuncs, CombinedIndex, Mod);
+  DenseSet<const Function *> visitedFuncs;
+  DenseMap<const Function *, uint64_t> EntryFuncs;
+
+  auto visitedSCG = [&](const Function *F) {
+    SmallVector<const Function *> WorkList;
+    DenseSet<const Function *> FindedFuncs;
+    WorkList.push_back(F);
+    while (!WorkList.empty()) {
+      const auto &CurFn = *WorkList.pop_back_val();
+      for (auto &SCGNode : *SCG.at(&CurFn)) {
+        auto *Callee = SCGNode->getFunction();
+        if (!Callee || Callee->isDeclaration())
+          continue;
+
+        auto [It, Inserted] = FindedFuncs.insert(Callee);
+        if (Inserted) {
+          WorkList.push_back(Callee);
+          EntryFuncs[F] += calFunctionSize(*Callee);
+          visitedFuncs.insert(Callee);
+        }
+      }
+    }
+  };
+
+  for (auto &NodePair : SCG) {
+    SimplifyCallGraphNode *SCGNode = NodePair.second.get();
+    Function *F = SCGNode->getFunction();
+    if (F && SCGNode->getNumReferences() == 0) {
+      EntryFuncs[F] = calFunctionSize(*F);
+      visitedFuncs.insert(F);
+    }
+  }
+
+  for (auto &Entry : EntryFuncs) {
+    visitedSCG(Entry.first);
+  }
+
+  for (auto &F : Mod) {
+    if (F.isDeclaration())
+      continue;
+    if (visitedFuncs.count(&F))
+      continue;
+    visitedFuncs.insert(&F);
+    EntryFuncs[&F] = calFunctionSize(F);
+    visitedSCG(&F);
+  }
+  uint64_t moduleSize = calModuleSize(Mod);
+
+  for (auto &SizePair : EntryFuncs) {
+    if (SizePair.second >= moduleSize * ThinLTOSplitModuleSizeRiteThreshold) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 Error lto::thinBackend(const Config &Conf, unsigned Task, AddStreamFn AddStream,
                        Module &Mod, ModuleSummaryIndex &CombinedIndex,
                        const FunctionImporter::ImportMapTy &ImportList,
@@ -1223,7 +1294,7 @@ Error lto::thinBackend(const Config &Conf, unsigned Task, AddStreamFn AddStream,
 
   bool ProfitableToSplit = true;
   if (ThinLTOSplit) {
-    if (!canDoSplitModule(Mod)) {
+    if (!canDoSplitModule(Mod) || !HasLargeCG(Mod, CombinedIndex)) {
       ProfitableToSplit = false;
       LLVM_DEBUG(dbgs() << "warning: thinlto split not enable for module: "
                         << Mod.getName());
