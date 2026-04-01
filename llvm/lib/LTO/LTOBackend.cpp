@@ -1190,8 +1190,8 @@ updateIndexSummaryForInternalizeSymbol(ModuleSummaryIndex &CombinedIndex,
 
 static bool HasLargeCG(Module &Mod, const ModuleSummaryIndex &CombinedIndex) {
   llvm::CallGraph CG(Mod);
-  DenseSet<const Function *> LargeFuncs, HotFuncs, AliasesFuncs;
-  llvm::SimplifyCallGraph SCG(CG, LargeFuncs, HotFuncs, AliasesFuncs, CombinedIndex, Mod);
+  DenseSet<const Function *> LargeFuncs, HotFuncs;
+  llvm::SimplifyCallGraph SCG(CG, LargeFuncs, HotFuncs, CombinedIndex, Mod);
   DenseSet<const Function *> visitedFuncs;
   DenseMap<const Function *, uint64_t> EntryFuncs;
 

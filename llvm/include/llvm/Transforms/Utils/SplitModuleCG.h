@@ -35,11 +35,9 @@ public:
   explicit SimplifyCallGraph(CallGraph &CG,
                              DenseSet<const Function *> &LargeFuncs,
                              DenseSet<const Function *> &HotFuncs,
-                             DenseSet<const Function *> &AliasesFuncs,
                              const ModuleSummaryIndex &CombinedIndex,
                              Module &M)
-      : CG(CG), LargeFuncs(LargeFuncs), HotFuncs(HotFuncs),
-        AliasesFuncs(AliasesFuncs), M(M) {
+      : CG(CG), LargeFuncs(LargeFuncs), HotFuncs(HotFuncs), M(M) {
     createSimplifyCallGraph(CombinedIndex);
   }
   ~SimplifyCallGraph() {};
@@ -94,7 +92,6 @@ private:
   Module &M;
   DenseSet<const Function *> &LargeFuncs;
   DenseSet<const Function *> &HotFuncs;
-  DenseSet<const Function *> &AliasesFuncs;
   DenseMap<const Function *, DenseSet<const GlobalVariable *>> VTableRecord;
 };
 
@@ -221,40 +218,18 @@ struct FunctionWithDependencies {
   FunctionWithDependencies(SimplifyCallGraph &SCG,
                            const DenseMap<const Function *, CostType> &FnCosts,
                            const Function *F,
-                           const DenseSet<const Function *> &AliasesFuncs,
-                           DenseMap<const Function *, bool> &externalFunction,
-			                     const DenseSet<const Function *> &IfuncFuncs,
-                           const DenseSet<const Function *> &ComdatFuncs)
+                           DenseMap<const Function *, bool> &externalFunction)
       : F(F) {
     addAllDependencies(SCG, *F, Dependencies, externalFunction);
-    if (AliasesFuncs.count(F))
-      HasAliasesCall = true;
-    // If the function is an ifunc resolver, it must stay in the every partition.
-    if (IfuncFuncs.count(F))
-      HasIfuncResolver = true;
-    // If the function is in a comdat, it must stay in the first partition.
-    if (ComdatFuncs.count(F))
-      HasComdatMember = true;
 
     TotalCost = FnCosts.at(F);
     for (const auto *Dep : Dependencies) {
       TotalCost += FnCosts.lookup(Dep);
-      if (AliasesFuncs.count(Dep))
-        HasAliasesCall = true;
-      if (IfuncFuncs.count(Dep))
-        HasIfuncResolver = true;
-      if (ComdatFuncs.count(Dep))
-        HasComdatMember = true;
     }
   }
 
   const Function *F = nullptr;
   DenseSet<const Function *> Dependencies;
-  /// Whether \p F or any of its \ref Dependencies contains an indirect call.
-  bool HasAliasesCall = false;
-  bool HasIfuncResolver = false;
-  bool HasComdatMember = false;
-  
   CostType TotalCost = 0;
   int SplitedLayer = 0;
 
@@ -281,8 +256,6 @@ public:
   unsigned getPartitionNum() { return N; }
   StringSet<> &getOriginalExternals() { return OriginalExternals; }
   StringMap<std::string> &getPromotedRenames() { return PromotedRenames; }
-  DenseSet<const Function *> &getIfuncFuncs() { return IfuncFuncs; }
-
 private:
   unsigned N;
   Module &M;
@@ -293,32 +266,29 @@ private:
   DenseSet<const Function *> EntryFuncs;
   DenseSet<const Function *> LargeFuncs;
   DenseSet<const Function *> HotFuncs;
-  DenseSet<const Function *> DependenciesForMain;
-  DenseSet<const Function *> AliasesFuncs;
-  DenseSet<const Function *> IfuncFuncs;
-  DenseSet<const Function *> ComdatFuncs;
-  DenseSet<const Function *> IndirectCalleeFuncs;
   StringSet<> OriginalExternals;
   StringMap<std::string> PromotedRenames;
   DenseMap<const Function *, bool> externalFunction;
-  DenseMap<const GlobalVariable *, bool> ExternalGVs;
+  DenseMap<const GlobalValue *, bool> ExternalGValues;
+  DenseMap<const Function *, DenseSet<const GlobalAlias *>> AliasesRecord;
+  DenseMap<const Function *, DenseSet<const GlobalIFunc *>> IfuncRecord;
+  DenseMap<const Function *, DenseSet<const GlobalVariable *>> GVRecord;
   DenseMap<const Function *, CostType> FuncsCosts;
   DefaultThreadPool *PartitionThreadPool;
   const llvm::lto::Config &C;
   DenseMap<const Comdat *, DenseSet<const GlobalValue *>> ComdatMembers;
+  DenseSet<const GlobalValue *> SpecialGV;
 
   void calculateEntryFuncs();
   void calculateFunctionCosts();
   void calculateComdatMembers();
   void getLargeFunction();
   void getHotFunction();
-  void getAliasFunction();
-  void getIfuncFunction();
+  void DealWithAlias();
+  void DealWithIFunc();
   void splitLargeCG(SmallVector<llvm::FunctionWithDependencies> &WorkList);
   void UpdateFWDInfo(llvm::FunctionWithDependencies &FWD);
   bool shouldCloneFunction(const Function *Fn);
-  void stripDeclareDebugInfoImpl(Module &Mpart, int I);
-  void stripRetainedDebugInfoImpl(Module &Mpart, int I);
   void DealWithDuplicateDebugInfo(Module &MPart);
 };
 
