@@ -13,6 +13,19 @@ def build_accelerator: Separate<["--", "-"], "build-accelerator">,
   >;
 def: Joined<["--", "-"], "build-accelerator=">, Alias<build_accelerator>;
 
+def dwp: Separate<["--", "-"], "dwp">,
+  MetaVarName<"<dwp file>">,
+  HelpText<"Use <dwp file> as the split DWARF package paired with the input object">;
+def: Joined<["--", "-"], "dwp=">, Alias<dwp>;
+
+def experimental_dwp_output_image : Flag<["--"], "experimental-dwp-output-image">,
+  HelpText<"Write the retained DWP rewrite-plan payload image to <output file>">,
+  Flags<[HelpHidden]>;
+
+def experimental_dwp_output_bundle : Flag<["--"], "experimental-dwp-output-bundle">,
+  HelpText<"Write the retained DWP rewrite-plan records and payload image to <output file>">,
+  Flags<[HelpHidden]>;
+
 def help : Flag<["--"], "help">,
   HelpText<"Prints this help output">;
 

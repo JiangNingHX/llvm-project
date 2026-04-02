@@ -23,6 +23,7 @@ set(LLVM_LINK_COMPONENTS
 add_llvm_tool(llvm-dwarfutil
   llvm-dwarfutil.cpp
   DebugInfoLinker.cpp
+  DWPUtil.cpp
 
   DEPENDS
   intrinsics_gen

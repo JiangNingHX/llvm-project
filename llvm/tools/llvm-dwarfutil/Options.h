@@ -33,6 +33,7 @@ enum class DwarfUtilAccelKind : uint8_t {
 struct Options {
   std::string InputFileName;
   std::string OutputFileName;
+  std::string DWPFileName;
   bool DoGarbageCollection = false;
   bool DoODRDeduplication = false;
   bool BuildSeparateDebugFile = false;
@@ -42,10 +43,14 @@ struct Options {
   bool Verify = false;
   bool UseDWARFLinkerParallel = false;
   DwarfUtilAccelKind AccelTableKind = DwarfUtilAccelKind::None;
+  bool ExperimentalDWPOutputImage = false;
+  bool ExperimentalDWPOutputBundle = false;
 
   std::string getSeparateDebugFileName() const {
     return OutputFileName + ".debug";
   }
+
+  bool hasDWPInput() const { return !DWPFileName.empty(); }
 };
 
 } // namespace dwarfutil
