@@ -1293,11 +1293,12 @@ void DwarfDebug::finalizeModuleInfo() {
 
   finishEntityDefinitions();
 
-  // Include the DWO file name in the hash if there's more than one CU.
-  // This handles ThinLTO's situation where imported CUs may very easily be
-  // duplicate with the same CU partially imported into another ThinLTO unit.
+  // Include the DWO file name in the hash whenever split DWARF is in use.
+  // ThinLTO split codegen can emit multiple backend objects that each contain
+  // the same partial CU in different .dwo files. Hashing the split-dwarf file
+  // name avoids generating duplicate DWO IDs across those outputs.
   StringRef DWOName;
-  if (CUMap.size() > 1)
+  if (!Asm->TM.Options.MCOptions.SplitDwarfFile.empty())
     DWOName = Asm->TM.Options.MCOptions.SplitDwarfFile;
 
   // Handle anything that needs to be done on a per-unit basis after
