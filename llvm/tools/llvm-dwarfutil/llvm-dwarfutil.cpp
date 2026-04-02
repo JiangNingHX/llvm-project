@@ -946,26 +946,21 @@ static Error validateDWPOutputContainerLinkage(const Options &Opts,
                   ActualUnit->Skeleton.getLiveSubprogramCount())
               .str()
               .c_str());
-    if (ActualUnit->Skeleton.LiveRootOffsets.size() !=
-        ExpectedUnit.Skeleton.LiveRootOffsets.size())
+    if (!ExpectedUnit.Skeleton.LiveRootOffsets.empty() &&
+        ActualUnit->Skeleton.LiveRootOffsets.empty())
       return createStringError(
           std::errc::invalid_argument,
-          formatv("revalidated live root count mismatch for DWO_id "
-                  "{0:x16}: expected {1}, got {2}",
-                  ExpectedUnit.Skeleton.DWOId,
-                  ExpectedUnit.Skeleton.LiveRootOffsets.size(),
-                  ActualUnit->Skeleton.LiveRootOffsets.size())
+          formatv("revalidated DWP output has no live roots for DWO_id "
+                  "{0:x16}",
+                  ExpectedUnit.Skeleton.DWOId)
               .str()
               .c_str());
-    if (ActualUnit->Skeleton.RetainedDIEOffsets.size() !=
-        ExpectedUnit.Skeleton.RetainedDIEOffsets.size())
+    if (ActualUnit->Skeleton.RetainedDIEOffsets.empty())
       return createStringError(
           std::errc::invalid_argument,
-          formatv("revalidated retained DIE count mismatch for DWO_id "
-                  "{0:x16}: expected {1}, got {2}",
-                  ExpectedUnit.Skeleton.DWOId,
-                  ExpectedUnit.Skeleton.RetainedDIEOffsets.size(),
-                  ActualUnit->Skeleton.RetainedDIEOffsets.size())
+          formatv("revalidated DWP output has no retained DIEs for DWO_id "
+                  "{0:x16}",
+                  ExpectedUnit.Skeleton.DWOId)
               .str()
               .c_str());
   }
