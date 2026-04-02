@@ -6,11 +6,16 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "DWPUtil.h"
 #include "DebugInfoLinker.h"
 #include "Error.h"
 #include "Options.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/DebugInfo/DWARF/DWARFVerifier.h"
+#include "llvm/DebugInfo/DWARF/DWARFUnitIndex.h"
 #include "llvm/MC/MCTargetOptionsCommandFlags.h"
 #include "llvm/ObjCopy/CommonConfig.h"
 #include "llvm/ObjCopy/ConfigManager.h"
@@ -26,6 +31,11 @@
 #include "llvm/Support/Process.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/Endian.h"
+#include <chrono>
+#include <cstdlib>
+#include <limits>
 
 using namespace llvm;
 using namespace object;
@@ -65,6 +75,34 @@ namespace dwarfutil {
 
 std::string ToolName;
 
+static bool isDWPStageTimingEnabled() {
+  static const bool Enabled =
+      std::getenv("LLVM_DWARFUTIL_DWP_TIMING") != nullptr;
+  return Enabled;
+}
+
+class ScopedDWPStageTimer {
+public:
+  explicit ScopedDWPStageTimer(StringRef StageName)
+      : StageName(StageName.str()), Enabled(isDWPStageTimingEnabled()),
+        Start(std::chrono::steady_clock::now()) {}
+
+  ~ScopedDWPStageTimer() {
+    if (!Enabled)
+      return;
+
+    const auto Elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - Start);
+    errs() << formatv("[llvm-dwarfutil][dwp-timing] {0}: {1:F3}s\n", StageName,
+                      Elapsed.count());
+  }
+
+private:
+  std::string StageName;
+  bool Enabled = false;
+  std::chrono::steady_clock::time_point Start;
+};
+
 static mc::RegisterMCTargetOptionsFlags MOF;
 
 static Error validateAndSetOptions(opt::InputArgList &Args, Options &Options) {
@@ -96,11 +134,18 @@ static Error validateAndSetOptions(opt::InputArgList &Args, Options &Options) {
       Args.hasFlag(OPT_garbage_collection, OPT_no_garbage_collection, true);
   Options.Verbose = Args.hasArg(OPT_verbose);
   Options.Verify = Args.hasArg(OPT_verify);
+  Options.ExperimentalDWPOutputImage =
+      Args.hasArg(OPT_experimental_dwp_output_image);
+  Options.ExperimentalDWPOutputBundle =
+      Args.hasArg(OPT_experimental_dwp_output_bundle);
 
-  if (opt::Arg *NumThreads = Args.getLastArg(OPT_threads))
+  if (opt::Arg *NumThreads = Args.getLastArg(OPT_threads)) {
     Options.NumThreads = atoi(NumThreads->getValue());
-  else
+    Options.NumThreadsExplicit = true;
+  } else {
     Options.NumThreads = 0; // Use all available hardware threads
+    Options.NumThreadsExplicit = false;
+  }
 
   if (opt::Arg *Tombstone = Args.getLastArg(OPT_tombstone)) {
     StringRef S = Tombstone->getValue();
@@ -143,6 +188,9 @@ static Error validateAndSetOptions(opt::InputArgList &Args, Options &Options) {
           formatv("unknown build-accelerator value: '{0}'", S).str().c_str());
   }
 
+  if (opt::Arg *DWPFile = Args.getLastArg(OPT_dwp))
+    Options.DWPFileName = DWPFile->getValue();
+
   if (Options.Verbose) {
     if (Options.NumThreads != 1 && Args.hasArg(OPT_threads))
       warning("--num-threads set to 1 because verbose mode is specified");
@@ -160,6 +208,81 @@ static Error validateAndSetOptions(opt::InputArgList &Args, Options &Options) {
     return createStringError(
         std::errc::invalid_argument,
         "unable to write to stdout when --separate-debug-file specified");
+
+  if (Options.hasDWPInput() && Options.OutputFileName == "-")
+    return createStringError(std::errc::invalid_argument,
+                             "the current --dwp path cannot write to stdout");
+
+  if (Options.hasDWPInput() && Options.InputFileName == "-")
+    return createStringError(std::errc::invalid_argument,
+                             "the current --dwp path cannot read the main "
+                             "input from stdin");
+
+  if (Options.DWPFileName == "-")
+    return createStringError(std::errc::invalid_argument,
+                             "the current --dwp path cannot read the DWP "
+                             "input from stdin");
+
+  if (Options.ExperimentalDWPOutputImage || Options.ExperimentalDWPOutputBundle) {
+    unsigned ExperimentalOutputs =
+        static_cast<unsigned>(Options.ExperimentalDWPOutputImage) +
+        static_cast<unsigned>(Options.ExperimentalDWPOutputBundle);
+    if (ExperimentalOutputs > 1)
+      return createStringError(
+          std::errc::invalid_argument,
+          "cannot use multiple experimental DWP output modes together");
+    if (!Options.hasDWPInput())
+      return createStringError(
+          std::errc::invalid_argument,
+          "experimental DWP output requires --dwp");
+    if (Options.DoGarbageCollection)
+      return createStringError(
+          std::errc::invalid_argument,
+          "experimental DWP output requires --no-garbage-collection");
+    if (Options.DoODRDeduplication)
+      return createStringError(
+          std::errc::invalid_argument,
+          "experimental DWP output requires --no-odr-deduplication");
+    if (Options.BuildSeparateDebugFile)
+      return createStringError(
+          std::errc::invalid_argument,
+          "experimental DWP output cannot be used with --separate-debug-file");
+    if (Options.Verify)
+      return createStringError(
+          std::errc::invalid_argument,
+          "experimental DWP output cannot be used with --verify");
+    if (Options.AccelTableKind != DwarfUtilAccelKind::None)
+      return createStringError(
+          std::errc::invalid_argument,
+          "experimental DWP output requires --build-accelerator=none");
+  }
+
+  if (Options.hasDWPInput() && !Options.ExperimentalDWPOutputImage &&
+      !Options.ExperimentalDWPOutputBundle) {
+    if (!Options.DoGarbageCollection)
+      return createStringError(
+          std::errc::invalid_argument,
+          "the current --dwp path requires --garbage-collection");
+    if (Options.DoODRDeduplication && Args.hasArg(OPT_odr_deduplication))
+      return createStringError(
+          std::errc::invalid_argument,
+          "the current --dwp path does not yet support "
+          "--odr-deduplication");
+    Options.DoODRDeduplication = false;
+    if (Options.BuildSeparateDebugFile)
+      return createStringError(
+          std::errc::invalid_argument,
+          "the current --dwp path cannot be used with "
+          "--separate-debug-file");
+    if (Options.Verify)
+      return createStringError(
+          std::errc::invalid_argument,
+          "the current --dwp path cannot be used with --verify");
+    if (Options.AccelTableKind != DwarfUtilAccelKind::None)
+      return createStringError(
+          std::errc::invalid_argument,
+          "the current --dwp path requires --build-accelerator=none");
+  }
 
   return Error::success();
 }
@@ -442,6 +565,469 @@ static Error saveCopyOfFile(const Options &Opts, ObjectFile &InputFile) {
   return Error::success();
 }
 
+static Error saveDWPOutputImage(const Options &Opts, const DWPLinkMap &LinkMap) {
+  const RetainedDWPOutputManifest &Manifest = LinkMap.RewritePlan.OutputManifest;
+
+  std::error_code EC;
+  ToolOutputFile Output(Opts.OutputFileName, EC, sys::fs::OF_None);
+  if (EC)
+    return createFileError(Opts.OutputFileName, EC);
+
+  StringRef Payload = Manifest.PayloadImage;
+  Output.os().write(Payload.data(), Payload.size());
+  Output.keep();
+  verbose(formatv("Wrote retained DWP output image '{0}': size={1:x}",
+                  Opts.OutputFileName, Payload.size()),
+          Opts.Verbose);
+  return Error::success();
+}
+
+struct DWPOutputBundleRecord {
+  DWARFSectionKind Kind = DW_SECT_EXT_unknown;
+  std::string Name;
+  uint64_t PayloadOffset = 0;
+  uint64_t PayloadSize = 0;
+};
+
+static void appendU32(std::string &Buffer, uint32_t Value, bool IsLittleEndian) {
+  char Bytes[sizeof(uint32_t)];
+  if (IsLittleEndian)
+    support::endian::write32le(Bytes, Value);
+  else
+    support::endian::write32be(Bytes, Value);
+  Buffer.append(Bytes, sizeof(Bytes));
+}
+
+static void appendU64(std::string &Buffer, uint64_t Value, bool IsLittleEndian) {
+  char Bytes[sizeof(uint64_t)];
+  if (IsLittleEndian)
+    support::endian::write64le(Bytes, Value);
+  else
+    support::endian::write64be(Bytes, Value);
+  Buffer.append(Bytes, sizeof(Bytes));
+}
+
+static Expected<uint32_t> readU32LE(StringRef Buffer, uint64_t &Offset) {
+  if (Offset + sizeof(uint32_t) > Buffer.size())
+    return createStringError(std::errc::invalid_argument,
+                             "unexpected end of bundle while reading u32");
+  uint32_t Value = support::endian::read32le(Buffer.data() + Offset);
+  Offset += sizeof(uint32_t);
+  return Value;
+}
+
+static Expected<uint64_t> readU64LE(StringRef Buffer, uint64_t &Offset) {
+  if (Offset + sizeof(uint64_t) > Buffer.size())
+    return createStringError(std::errc::invalid_argument,
+                             "unexpected end of bundle while reading u64");
+  uint64_t Value = support::endian::read64le(Buffer.data() + Offset);
+  Offset += sizeof(uint64_t);
+  return Value;
+}
+
+static Expected<std::string>
+buildDWPOutputBundleImage(const RetainedDWPOutputManifest &Manifest) {
+  constexpr StringLiteral Magic = "DWPBNDL1";
+  const uint32_t Version = 1;
+  const uint32_t RecordCount = Manifest.Records.size();
+  const uint64_t HeaderSize = Magic.size() + sizeof(uint32_t) +
+                              sizeof(uint32_t) + sizeof(uint64_t) +
+                              sizeof(uint64_t);
+  uint64_t RecordsSize = 0;
+  for (const RetainedDWPOutputRecord &Record : Manifest.Records) {
+    if (Record.Name.size() > std::numeric_limits<uint32_t>::max())
+      return createStringError(
+          std::errc::invalid_argument,
+          formatv("bundle record name too large for section '{0}'", Record.Name)
+              .str()
+              .c_str());
+    RecordsSize += sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint64_t) +
+                   sizeof(uint64_t) + Record.Name.size();
+  }
+  const uint64_t PayloadOffset = HeaderSize + RecordsSize;
+  const uint64_t PayloadSize = Manifest.PayloadImage.size();
+
+  std::string BundleImage;
+  BundleImage.reserve(PayloadOffset + PayloadSize);
+  BundleImage.append(Magic.data(), Magic.size());
+  appendU32(BundleImage, Version, /*IsLittleEndian=*/true);
+  appendU32(BundleImage, RecordCount, /*IsLittleEndian=*/true);
+  appendU64(BundleImage, PayloadOffset, /*IsLittleEndian=*/true);
+  appendU64(BundleImage, PayloadSize, /*IsLittleEndian=*/true);
+
+  for (const RetainedDWPOutputRecord &Record : Manifest.Records) {
+    appendU32(BundleImage, static_cast<uint32_t>(Record.Kind),
+              /*IsLittleEndian=*/true);
+    appendU32(BundleImage, static_cast<uint32_t>(Record.Name.size()),
+              /*IsLittleEndian=*/true);
+    appendU64(BundleImage, Record.PayloadOffset, /*IsLittleEndian=*/true);
+    appendU64(BundleImage, Record.PayloadSize, /*IsLittleEndian=*/true);
+    BundleImage.append(Record.Name);
+  }
+
+  BundleImage.append(Manifest.PayloadImage);
+  return BundleImage;
+}
+
+static Expected<SmallVector<DWPOutputBundleRecord, 8>>
+parseDWPOutputBundleRecords(StringRef BundleImage, uint64_t &PayloadOffset,
+                            uint64_t &PayloadSize) {
+  constexpr StringLiteral Magic = "DWPBNDL1";
+  if (!BundleImage.starts_with(Magic))
+    return createStringError(std::errc::invalid_argument,
+                             "invalid DWP bundle magic");
+
+  uint64_t Offset = Magic.size();
+  Expected<uint32_t> VersionOrErr = readU32LE(BundleImage, Offset);
+  if (!VersionOrErr)
+    return VersionOrErr.takeError();
+  if (*VersionOrErr != 1)
+    return createStringError(
+        std::errc::invalid_argument,
+        formatv("unsupported DWP bundle version: {0}", *VersionOrErr)
+            .str()
+            .c_str());
+
+  Expected<uint32_t> RecordCountOrErr = readU32LE(BundleImage, Offset);
+  if (!RecordCountOrErr)
+    return RecordCountOrErr.takeError();
+  Expected<uint64_t> PayloadOffsetOrErr = readU64LE(BundleImage, Offset);
+  if (!PayloadOffsetOrErr)
+    return PayloadOffsetOrErr.takeError();
+  Expected<uint64_t> PayloadSizeOrErr = readU64LE(BundleImage, Offset);
+  if (!PayloadSizeOrErr)
+    return PayloadSizeOrErr.takeError();
+
+  PayloadOffset = *PayloadOffsetOrErr;
+  PayloadSize = *PayloadSizeOrErr;
+
+  SmallVector<DWPOutputBundleRecord, 8> Records;
+  Records.reserve(*RecordCountOrErr);
+  for (uint32_t I = 0; I != *RecordCountOrErr; ++I) {
+    Expected<uint32_t> KindOrErr = readU32LE(BundleImage, Offset);
+    if (!KindOrErr)
+      return KindOrErr.takeError();
+    Expected<uint32_t> NameSizeOrErr = readU32LE(BundleImage, Offset);
+    if (!NameSizeOrErr)
+      return NameSizeOrErr.takeError();
+    Expected<uint64_t> RecordPayloadOffsetOrErr = readU64LE(BundleImage, Offset);
+    if (!RecordPayloadOffsetOrErr)
+      return RecordPayloadOffsetOrErr.takeError();
+    Expected<uint64_t> RecordPayloadSizeOrErr = readU64LE(BundleImage, Offset);
+    if (!RecordPayloadSizeOrErr)
+      return RecordPayloadSizeOrErr.takeError();
+    if (Offset + *NameSizeOrErr > BundleImage.size())
+      return createStringError(std::errc::invalid_argument,
+                               "bundle record name exceeds image bounds");
+
+    DWPOutputBundleRecord &Record = Records.emplace_back();
+    Record.Kind = static_cast<DWARFSectionKind>(*KindOrErr);
+    Record.Name = std::string(
+        BundleImage.slice(Offset, Offset + *NameSizeOrErr));
+    Record.PayloadOffset = *RecordPayloadOffsetOrErr;
+    Record.PayloadSize = *RecordPayloadSizeOrErr;
+    Offset += *NameSizeOrErr;
+  }
+
+  return Records;
+}
+
+static Error validateDWPOutputBundleImage(
+    StringRef BundleImage, const RetainedDWPOutputManifest &Manifest) {
+  uint64_t PayloadOffset = 0;
+  uint64_t PayloadSize = 0;
+  Expected<SmallVector<DWPOutputBundleRecord, 8>> RecordsOrErr =
+      parseDWPOutputBundleRecords(BundleImage, PayloadOffset, PayloadSize);
+  if (!RecordsOrErr)
+    return RecordsOrErr.takeError();
+
+  if (RecordsOrErr->size() != Manifest.Records.size())
+    return createStringError(
+        std::errc::invalid_argument,
+        formatv("bundle record count mismatch: expected {0}, got {1}",
+                Manifest.Records.size(), RecordsOrErr->size())
+            .str()
+            .c_str());
+  if (PayloadOffset > BundleImage.size() ||
+      PayloadOffset + PayloadSize > BundleImage.size())
+    return createStringError(std::errc::invalid_argument,
+                             "bundle payload header exceeds image bounds");
+
+  for (size_t I = 0; I != Manifest.Records.size(); ++I) {
+    const RetainedDWPOutputRecord &Expected = Manifest.Records[I];
+    const DWPOutputBundleRecord &Parsed = (*RecordsOrErr)[I];
+    if (Parsed.Kind != Expected.Kind || Parsed.Name != Expected.Name ||
+        Parsed.PayloadOffset != Expected.PayloadOffset ||
+        Parsed.PayloadSize != Expected.PayloadSize)
+      return createStringError(
+          std::errc::invalid_argument,
+          formatv("bundle record mismatch for section '{0}'", Expected.Name)
+              .str()
+              .c_str());
+  }
+
+  StringRef ParsedPayload =
+      BundleImage.slice(PayloadOffset, PayloadOffset + PayloadSize);
+  if (ParsedPayload != Manifest.PayloadImage)
+    return createStringError(std::errc::invalid_argument,
+                             "bundle payload image mismatch");
+
+  return Error::success();
+}
+
+static Expected<std::string>
+buildRetainedDWPIndexSection(const DWPLinkMap &LinkMap, bool IsLittleEndian) {
+  if (LinkMap.CUIndexVersion == 0)
+    return createStringError(std::errc::invalid_argument,
+                             "missing CU index version for retained DWP index");
+  if (LinkMap.CUIndexColumnKinds.empty())
+    return createStringError(std::errc::invalid_argument,
+                             "missing CU index columns for retained DWP index");
+
+  DenseMap<uint64_t, DenseMap<DWARFSectionKind,
+                              DWARFUnitIndex::Entry::SectionContribution>>
+      NewContributionsByDWOId;
+
+  for (const RetainedDWPPackageUnitInfo &Unit : LinkMap.RetainedPackageUnits)
+    for (const PackageUnitInfo::SectionContributionInfo &Contribution :
+         Unit.Contributions)
+      NewContributionsByDWOId[Unit.Unit.DWOId][Contribution.Kind] =
+          DWARFUnitIndex::Entry::SectionContribution(Contribution.Offset,
+                                                     Contribution.Length);
+
+  for (const RetainedDWPSectionContributionInfo &Contribution :
+       LinkMap.RewritePlan.Contributions)
+    NewContributionsByDWOId[Contribution.DWOId][Contribution.Kind] =
+        DWARFUnitIndex::Entry::SectionContribution(Contribution.OutputOffset,
+                                                   Contribution.Length);
+
+  const size_t NumUnits = LinkMap.RetainedPackageUnits.size();
+  const size_t NumBuckets = std::max<size_t>(1, NextPowerOf2(3 * NumUnits / 2));
+  SmallVector<uint32_t, 8> Buckets(NumBuckets, 0);
+  const uint64_t Mask = NumBuckets - 1;
+
+  for (size_t I = 0; I != NumUnits; ++I) {
+    uint64_t Signature = LinkMap.RetainedPackageUnits[I].Unit.DWOId;
+    uint64_t H = Signature & Mask;
+    uint64_t HP = ((Signature >> 32) & Mask) | 1;
+    while (Buckets[H] != 0)
+      H = (H + HP) & Mask;
+    Buckets[H] = static_cast<uint32_t>(I + 1);
+  }
+
+  std::string Index;
+  Index.reserve(16 + NumBuckets * 12 +
+                LinkMap.CUIndexColumnKinds.size() * 4 * (1 + 2 * NumUnits));
+  appendU32(Index, LinkMap.CUIndexVersion, IsLittleEndian);
+  appendU32(Index, static_cast<uint32_t>(LinkMap.CUIndexColumnKinds.size()),
+            IsLittleEndian);
+  appendU32(Index, static_cast<uint32_t>(NumUnits), IsLittleEndian);
+  appendU32(Index, static_cast<uint32_t>(NumBuckets), IsLittleEndian);
+
+  for (uint32_t Bucket : Buckets) {
+    uint64_t Signature =
+        Bucket ? LinkMap.RetainedPackageUnits[Bucket - 1].Unit.DWOId : 0;
+    appendU64(Index, Signature, IsLittleEndian);
+  }
+  for (uint32_t Bucket : Buckets)
+    appendU32(Index, Bucket, IsLittleEndian);
+
+  for (DWARFSectionKind Kind : LinkMap.CUIndexColumnKinds)
+    appendU32(Index, serializeSectionKind(Kind, LinkMap.CUIndexVersion),
+              IsLittleEndian);
+
+  for (const RetainedDWPPackageUnitInfo &Unit : LinkMap.RetainedPackageUnits) {
+    auto It = NewContributionsByDWOId.find(Unit.Unit.DWOId);
+    for (DWARFSectionKind Kind : LinkMap.CUIndexColumnKinds) {
+      uint64_t Offset = 0;
+      if (It != NewContributionsByDWOId.end()) {
+        auto Found = It->second.find(Kind);
+        if (Found != It->second.end())
+          Offset = Found->second.getOffset();
+      }
+      appendU32(Index, static_cast<uint32_t>(Offset), IsLittleEndian);
+    }
+  }
+
+  for (const RetainedDWPPackageUnitInfo &Unit : LinkMap.RetainedPackageUnits) {
+    auto It = NewContributionsByDWOId.find(Unit.Unit.DWOId);
+    for (DWARFSectionKind Kind : LinkMap.CUIndexColumnKinds) {
+      uint64_t Length = 0;
+      if (It != NewContributionsByDWOId.end()) {
+        auto Found = It->second.find(Kind);
+        if (Found != It->second.end())
+          Length = Found->second.getLength();
+      }
+      appendU32(Index, static_cast<uint32_t>(Length), IsLittleEndian);
+    }
+  }
+
+  return Index;
+}
+
+static Error validateDWPOutputContainerPrototype(
+    StringRef OutputFileName, const DWPLinkMap &LinkMap,
+    StringRef ExpectedCUIndexContents) {
+  Expected<OwningBinary<Binary>> BinOrErr = object::createBinary(OutputFileName);
+  if (!BinOrErr)
+    return createFileError(OutputFileName, BinOrErr.takeError());
+  if (!BinOrErr->getBinary()->isObject())
+    return createFileError(OutputFileName,
+                           createError("unsupported output DWP file"));
+
+  auto *OutputObject = cast<ObjectFile>(BinOrErr->getBinary());
+  DenseMap<StringRef, StringRef> SectionContents;
+  for (const SectionRef &Section : OutputObject->sections()) {
+    Expected<StringRef> NameOrErr = Section.getName();
+    if (!NameOrErr)
+      return NameOrErr.takeError();
+    Expected<StringRef> ContentsOrErr = Section.getContents();
+    if (!ContentsOrErr)
+      return ContentsOrErr.takeError();
+    SectionContents[*NameOrErr] = *ContentsOrErr;
+  }
+
+  for (const RetainedDWPOutputSection &Section :
+       LinkMap.RewritePlan.OutputManifest.Sections) {
+    auto It = SectionContents.find(Section.Name);
+    if (It == SectionContents.end())
+      return createStringError(
+          std::errc::invalid_argument,
+          formatv("missing retained container section '{0}'", Section.Name)
+              .str()
+              .c_str());
+    if (It->second != Section.Contents)
+      return createStringError(
+          std::errc::invalid_argument,
+          formatv("retained container section payload mismatch for '{0}'",
+                  Section.Name)
+              .str()
+              .c_str());
+  }
+
+  auto CUIndexIt = SectionContents.find(".debug_cu_index");
+  if (CUIndexIt == SectionContents.end())
+    return createStringError(std::errc::invalid_argument,
+                             "missing retained container .debug_cu_index");
+  if (CUIndexIt->second != ExpectedCUIndexContents)
+    return createStringError(std::errc::invalid_argument,
+                             "retained container .debug_cu_index mismatch");
+
+  return Error::success();
+}
+
+static Error saveDWPOutputContainerPrototype(const Options &Opts,
+                                            const DWPLinkMap &LinkMap) {
+  ScopedDWPStageTimer Timer("save-dwp-output-container-prototype");
+  Expected<OwningBinary<Binary>> DWPBinOrErr = createBinary(Opts.DWPFileName);
+  if (!DWPBinOrErr)
+    return createFileError(Opts.DWPFileName, DWPBinOrErr.takeError());
+  if (!DWPBinOrErr->getBinary()->isObject())
+    return createFileError(Opts.DWPFileName,
+                           createError("unsupported DWP input file"));
+
+  auto *DWPObject = cast<ObjectFile>(DWPBinOrErr->getBinary());
+  Expected<std::string> CUIndexContentsOrErr = [&]() -> Expected<std::string> {
+    ScopedDWPStageTimer StageTimer(
+        "save-dwp-output-container-prototype.build-cu-index");
+    return buildRetainedDWPIndexSection(LinkMap, DWPObject->isLittleEndian());
+  }();
+  if (!CUIndexContentsOrErr)
+    return CUIndexContentsOrErr.takeError();
+
+  DenseSet<StringRef> ExistingSections;
+  {
+    ScopedDWPStageTimer StageTimer(
+        "save-dwp-output-container-prototype.enumerate-sections");
+    for (const SectionRef &Section : DWPObject->sections()) {
+      Expected<StringRef> NameOrErr = Section.getName();
+      if (!NameOrErr)
+        return NameOrErr.takeError();
+      ExistingSections.insert(*NameOrErr);
+    }
+  }
+
+  objcopy::ConfigManager Config;
+  Config.Common.InputFilename = Opts.DWPFileName;
+  Config.Common.OutputFilename = Opts.OutputFileName;
+
+  auto AddOrUpdateSection = [&](StringRef Name, StringRef Contents) {
+    auto Buffer = MemoryBuffer::getMemBufferCopy(Contents, Name);
+    if (ExistingSections.contains(Name))
+      Config.Common.UpdateSection.emplace_back(Name, std::move(Buffer));
+    else
+      Config.Common.AddSection.emplace_back(Name, std::move(Buffer));
+  };
+
+  for (const RetainedDWPOutputSection &Section :
+       LinkMap.RewritePlan.OutputManifest.Sections)
+    AddOrUpdateSection(Section.Name, Section.Contents);
+  AddOrUpdateSection(".debug_cu_index", *CUIndexContentsOrErr);
+
+  {
+    ScopedDWPStageTimer StageTimer(
+        "save-dwp-output-container-prototype.write-output");
+    if (Error Err = writeToOutput(
+            Config.Common.OutputFilename, [&](raw_ostream &OutFile) -> Error {
+              return objcopy::executeObjcopyOnBinary(Config, *DWPObject,
+                                                     OutFile);
+            }))
+      return Err;
+  }
+
+  {
+    ScopedDWPStageTimer StageTimer(
+        "save-dwp-output-container-prototype.validate-container");
+    if (Error Err = validateDWPOutputContainerPrototype(
+            Opts.OutputFileName, LinkMap, *CUIndexContentsOrErr))
+      return Err;
+  }
+  {
+    ScopedDWPStageTimer StageTimer(
+        "save-dwp-output-container-prototype.validate-linkage");
+    if (Error Err = validateRetainedDWPOutputContainerLinkage(Opts, LinkMap))
+      return Err;
+  }
+
+  verbose(formatv("Wrote retained DWP container prototype '{0}': sections={1}, "
+                  "cu-index-units={2}",
+                  Opts.OutputFileName,
+                  LinkMap.RewritePlan.OutputManifest.Sections.size() + 1,
+                  LinkMap.RetainedPackageUnits.size()),
+          Opts.Verbose);
+  verbose("Validated retained DWP container contents", Opts.Verbose);
+  verbose("Validated retained DWP container linkage with main input",
+          Opts.Verbose);
+  return Error::success();
+}
+
+static Error saveDWPOutputBundle(const Options &Opts, const DWPLinkMap &LinkMap) {
+  const RetainedDWPOutputManifest &Manifest = LinkMap.RewritePlan.OutputManifest;
+
+  std::error_code EC;
+  ToolOutputFile Output(Opts.OutputFileName, EC, sys::fs::OF_None);
+  if (EC)
+    return createFileError(Opts.OutputFileName, EC);
+
+  Expected<std::string> BundleImageOrErr = buildDWPOutputBundleImage(Manifest);
+  if (!BundleImageOrErr)
+    return BundleImageOrErr.takeError();
+  if (Error Err = validateDWPOutputBundleImage(*BundleImageOrErr, Manifest))
+    return Err;
+
+  Output.os().write(BundleImageOrErr->data(), BundleImageOrErr->size());
+  Output.keep();
+  verbose(
+      formatv("Wrote retained DWP output bundle '{0}': records={1}, names={2}, "
+              "size={3:x}",
+              Opts.OutputFileName, Manifest.Records.size(),
+              BundleImageOrErr->size() - Manifest.PayloadImage.size(),
+              BundleImageOrErr->size()),
+      Opts.Verbose);
+  verbose("Validated retained DWP output bundle contents", Opts.Verbose);
+  return Error::success();
+}
+
 static Error applyCLOptions(const struct Options &Opts, ObjectFile &InputFile) {
   if (Opts.DoGarbageCollection ||
       Opts.AccelTableKind != DwarfUtilAccelKind::None) {
@@ -524,6 +1110,34 @@ int main(int Argc, char const *Argv[]) {
   if (!(*BinOrErr)->isObject())
     error(createFileError(Opts.InputFileName,
                           createError("unsupported input file")));
+
+  if (Opts.hasDWPInput()) {
+    Expected<DWPLinkMap> LinkMap =
+        loadDWPLinkMap(*static_cast<ObjectFile *>((*BinOrErr).get()), Opts);
+    if (!LinkMap)
+      error(std::move(LinkMap.takeError()), dwarfutil::ToolName);
+    logDWPLinkMap(*LinkMap, Opts);
+
+    if (Opts.ExperimentalDWPOutputImage) {
+      if (Error Err = saveDWPOutputImage(Opts, *LinkMap))
+        error(std::move(Err));
+      if (Error Err = PermsApplierOrErr->apply(Opts.OutputFileName))
+        error(std::move(Err));
+      return EXIT_SUCCESS;
+    }
+    if (Opts.ExperimentalDWPOutputBundle) {
+      if (Error Err = saveDWPOutputBundle(Opts, *LinkMap))
+        error(std::move(Err));
+      if (Error Err = PermsApplierOrErr->apply(Opts.OutputFileName))
+        error(std::move(Err));
+      return EXIT_SUCCESS;
+    }
+    if (Error Err = saveDWPOutputContainerPrototype(Opts, *LinkMap))
+      error(std::move(Err));
+    if (Error Err = PermsApplierOrErr->apply(Opts.OutputFileName))
+      error(std::move(Err));
+    return EXIT_SUCCESS;
+  }
 
   if (Error Err =
           applyCLOptions(Opts, *static_cast<ObjectFile *>((*BinOrErr).get())))

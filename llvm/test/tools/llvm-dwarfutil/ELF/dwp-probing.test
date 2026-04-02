@@ -1,0 +1,105 @@
+# REQUIRES: x86-registered-target
+## This test checks verbose --dwp probing on split DWARF package inputs.
+
+# RUN: llc -split-dwarf-file=%t1.dwo -filetype=obj -o %t1.o < %p/Inputs/dwp-probing-a.ll
+# RUN: llc -split-dwarf-file=%t2.dwo -filetype=obj -o %t2.o < %p/Inputs/dwp-probing-b.ll
+# RUN: llvm-dwp %t1.o %t2.o -o %t.dwp
+# RUN: cat %t.dwp | not llvm-dwarfutil --dwp - %t1.o %t.pkgstdin.dwp 2>&1 | FileCheck %s --check-prefix=DWPINERR
+# RUN: cat %t1.o | not llvm-dwarfutil --dwp %t.dwp - %t.stdin.dwp 2>&1 | FileCheck %s --check-prefix=STDINERR
+# RUN: not llvm-dwarfutil --dwp %t.dwp %t1.o - 2>&1 | FileCheck %s --check-prefix=STDOUTERR
+# RUN: not llvm-dwarfutil --odr-deduplication --dwp %t.dwp %t1.o %t.reject.dwp 2>&1 | FileCheck %s --check-prefix=ODRERR
+# RUN: llvm-dwarfutil --verbose --dwp %t.dwp %t1.o %t.proto.dwp 2>&1 | FileCheck %s --check-prefixes=CHECK,CONTAINER
+# RUN: llvm-dwarfutil --odr-deduplication --no-odr-deduplication --dwp %t.dwp %t1.o %t.override.dwp
+# RUN: cmp %t.proto.dwp %t.override.dwp
+# RUN: llvm-dwarfutil --num-threads 1 --dwp %t.dwp %t1.o %t.serial.dwp
+# RUN: llvm-dwarfutil --num-threads 2 --dwp %t.dwp %t1.o %t.parallel.dwp
+# RUN: cmp %t.serial.dwp %t.parallel.dwp
+# RUN: not llvm-dwarfutil --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-image --dwp %t.dwp %t1.o - 2>&1 | FileCheck %s --check-prefix=STDOUTERR
+# RUN: llvm-dwarfutil --verbose --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-image --dwp %t.dwp %t1.o %t.payload 2>&1 | FileCheck %s --check-prefix=IMAGE
+# RUN: test -s %t.payload
+# RUN: llvm-dwarfutil --num-threads 1 --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-image --dwp %t.dwp %t1.o %t.serial.payload
+# RUN: llvm-dwarfutil --num-threads 2 --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-image --dwp %t.dwp %t1.o %t.parallel.payload
+# RUN: cmp %t.serial.payload %t.parallel.payload
+# RUN: not llvm-dwarfutil --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-bundle --dwp %t.dwp %t1.o - 2>&1 | FileCheck %s --check-prefix=STDOUTERR
+# RUN: llvm-dwarfutil --verbose --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-bundle --dwp %t.dwp %t1.o %t.bundle 2>&1 | FileCheck %s --check-prefix=BUNDLE
+# RUN: test -s %t.bundle
+# RUN: llvm-dwarfutil --num-threads 1 --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-bundle --dwp %t.dwp %t1.o %t.serial.bundle
+# RUN: llvm-dwarfutil --num-threads 2 --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-bundle --dwp %t.dwp %t1.o %t.parallel.bundle
+# RUN: cmp %t.serial.bundle %t.parallel.bundle
+# RUN: llvm-dwarfdump --debug-cu-index %t.proto.dwp | FileCheck %s --check-prefix=INDEX
+# RUN: llvm-dwarfdump --debug-info %t.proto.dwp | FileCheck %s --check-prefix=INFO
+# RUN: llvm-dwarfdump --debug-abbrev %t.proto.dwp | FileCheck %s --check-prefix=ABBREV
+# RUN: llvm-dwarfdump --debug-loc %t.proto.dwp | FileCheck %s --check-prefix=LOC
+
+# CHECK: Detected 1 companion compile units in '{{.*}}.o'
+# CHECK: Detected 2 package compile units in '{{.*}}.dwp'
+# CHECK: Prepared rewrite plan: units=1, contributions=4
+# CHECK: Prepared output manifest: sections=5, total-size=0x{{[0-9a-f]+}}
+# CHECK: Prepared output image: size=0x{{[0-9a-f]+}}
+# CHECK: output-layout '.debug_info.dwo': offset=0x0, size=0x{{[0-9a-f]+}}
+# CHECK: output-layout '.debug_loc.dwo': offset=0x{{[0-9a-f]+}}, size=0x{{[0-9a-f]+}}
+# CHECK: output-layout '.debug_str.dwo': offset=0x{{[0-9a-f]+}}, size=0x{{[0-9a-f]+}}
+# CHECK: output-record '.debug_info.dwo': payload-offset=0x0, payload-size=0x{{[0-9a-f]+}}
+# CHECK: output-record '.debug_loc.dwo': payload-offset=0x{{[0-9a-f]+}}, payload-size=0x{{[0-9a-f]+}}
+# CHECK: output-record '.debug_str.dwo': payload-offset=0x{{[0-9a-f]+}}, payload-size=0x{{[0-9a-f]+}}
+# CHECK: output-slice '.debug_info.dwo': size=0x{{[0-9a-f]+}}
+# CHECK: output-slice '.debug_loc.dwo': size=0x{{[0-9a-f]+}}
+# CHECK: output-slice '.debug_str.dwo': size=0x{{[0-9a-f]+}}
+# CHECK: rewrite-section DW_SECT_INFO: contributions=1, total-length=0x{{[0-9a-f]+}}
+# CHECK: rewrite-input-section '.debug_info.dwo': size=0x{{[0-9a-f]+}}, materialized=0x{{[0-9a-f]+}}
+# CHECK: rewrite-output-section '.debug_info.dwo': size=0x{{[0-9a-f]+}}
+# CHECK: rewrite-contribution DW_SECT_INFO: section='.debug_info.dwo', size=0x{{[0-9a-f]+}}, off=0x{{[0-9a-f]+}}, in-len=0x{{[0-9a-f]+}}, len=0x{{[0-9a-f]+}}, out=0x0, dwo_id=0x{{[0-9a-f]+}}
+# CHECK: rewrite-section DW_SECT_LOC: contributions=1, total-length=0x{{[0-9a-f]+}}
+# CHECK: rewrite-input-section '.debug_loc.dwo': size=0x{{[0-9a-f]+}}, materialized=0x{{[0-9a-f]+}}
+# CHECK: rewrite-output-section '.debug_loc.dwo': size=0x{{[0-9a-f]+}}
+# CHECK: rewrite-contribution DW_SECT_LOC: section='.debug_loc.dwo', size=0x{{[0-9a-f]+}}, off=0x{{[0-9a-f]+}}, in-len=0x{{[0-9a-f]+}}, len=0x{{[0-9a-f]+}}, out=0x0, dwo_id=0x{{[0-9a-f]+}}
+# CHECK: Matched DWO_id 0x{{[0-9a-f]+}}: main-unit='{{.*}}tmp1.dwo' package='{{.*}}tmp1.dwo'
+# CHECK: split-unit='a.cpp'
+# CHECK: live-range [0x{{[0-9a-f]+}}, 0x{{[0-9a-f]+}}) section=
+# CHECK: addressable-subprograms=1
+# CHECK: live-roots=1
+# CHECK: retained-dies=4
+# CHECK: live-subprograms=1
+# CHECK: sample-subprogram='_Z1ai'
+# CHECK: sample-range [0x{{[0-9a-f]+}}, 0x{{[0-9a-f]+}}) section=
+# CHECK: retained-package-dies=4
+
+# IMAGE: Wrote retained DWP output image '{{.*}}.payload': size=0x{{[1-9a-f][0-9a-f]*}}
+
+# BUNDLE: Wrote retained DWP output bundle '{{.*}}.bundle': records=5, names={{[1-9][0-9]*}}, size=0x{{[1-9a-f][0-9a-f]*}}
+# BUNDLE: Validated retained DWP output bundle contents
+
+# DWPINERR: error: the current --dwp path cannot read the DWP input from stdin
+
+# STDINERR: error: the current --dwp path cannot read the main input from stdin
+
+# STDOUTERR: error: the current --dwp path cannot write to stdout
+
+# ODRERR: error: the current --dwp path does not yet support --odr-deduplication
+
+# CONTAINER: Wrote retained DWP container prototype '{{.*}}.proto.dwp': sections=6, cu-index-units=1
+# CONTAINER: Validated retained DWP container contents
+# CONTAINER: Validated retained DWP container linkage with main input
+
+# INDEX: .debug_cu_index contents:
+# INDEX: version = 2
+# INDEX: units = 1
+
+# INFO: .debug_info.dwo contents:
+# INFO: Compile Unit: length = 0x{{[0-9a-f]+}}
+# INFO: DW_TAG_compile_unit
+# INFO: DW_TAG_subprogram
+# INFO: DW_TAG_formal_parameter
+# INFO: DW_AT_type (0x{{[0-9a-f]+}} "int")
+# INFO: DW_TAG_base_type
+
+# ABBREV: .debug_abbrev.dwo contents:
+# ABBREV: [1] DW_TAG_compile_unit
+# ABBREV: [2] DW_TAG_subprogram
+# ABBREV: [3] DW_TAG_formal_parameter
+# ABBREV: [4] DW_TAG_base_type
+
+# LOC: .debug_loc.dwo contents:
+# LOC: 0x00000000:
+# LOC: DW_LLE_startx_length
+# LOC-NOT: 0x00000016:

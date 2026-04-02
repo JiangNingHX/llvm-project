@@ -1,0 +1,22 @@
+# REQUIRES: x86-registered-target
+## This test checks that --dwp accepts split units with no live subprogram roots.
+
+# RUN: llc -split-dwarf-file=%t.dwo -filetype=obj -o %t.o < %p/Inputs/dwp-empty-live-root.ll
+# RUN: llvm-dwp %t.o -o %t.dwp
+# RUN: llvm-dwarfutil --verbose --dwp %t.dwp %t.o %t.out.dwp 2>&1 | FileCheck %s --check-prefix=CHECK
+# RUN: llvm-dwarfdump --debug-info %t.out.dwp | FileCheck %s --check-prefix=INFO
+
+# CHECK: Detected 1 companion compile units in '{{.*}}.o'
+# CHECK: Detected 1 package compile units in '{{.*}}.dwp'
+# CHECK: Matched DWO_id 0x{{[0-9a-f]+}}: main-unit='{{.*}}.dwo' package='{{.*}}.dwo'
+# CHECK: addressable-subprograms=0
+# CHECK: live-roots=0
+# CHECK: retained-dies=1
+# CHECK: live-subprograms=0
+# CHECK: Validated retained DWP container contents
+# CHECK: Validated retained DWP container linkage with main input
+
+# INFO: .debug_info.dwo contents:
+# INFO: Compile Unit: length = 0x{{[0-9a-f]+}}
+# INFO: DW_TAG_compile_unit
+# INFO-NOT: DW_TAG_subprogram
