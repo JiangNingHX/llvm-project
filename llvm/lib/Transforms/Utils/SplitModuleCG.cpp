@@ -164,6 +164,7 @@ doGValuePartitioning(
   }
   return GValuePartitions;
 }
+} // namespace
 
 /// Performs all of the partitioning work on \p M.
 /// \param M Module to partition.
@@ -171,14 +172,11 @@ doGValuePartitioning(
 /// \param ModuleCost Total cost of all functions in \p M.
 /// \param FnCosts Map of Function -> Cost
 /// \param WorkList Functions and their dependencies to process in order.
-/// \param EntryFuncs Entry functions.
 /// \returns The created partitions (a vector of size \p NumParts)
-static std::vector<DenseSet<const Function *>>
-doPartitioning(Module &M, unsigned NumParts, CostType ModuleCost,
-               const DenseMap<const Function *, CostType> &FnCosts,
-               const SmallVector<FunctionWithDependencies> &WorkList,
-               const DenseSet<const Function *> &EntryFuncs,
-               DenseMap<const Comdat *, DenseSet<const GlobalValue *>> ComdatMembers) {
+std::vector<DenseSet<const Function *>>
+SplitModuleCG::doPartitioning(Module &M, unsigned NumParts, CostType ModuleCost,
+                              const DenseMap<const Function *, CostType> &FnCosts,
+                              const SmallVector<FunctionWithDependencies> &WorkList) {
   LLVM_DEBUG(dbgs() << "\n--Partitioning Starts--\n");
 
   std::vector<DenseSet<const Function *>> Partitions;
@@ -243,12 +241,34 @@ doPartitioning(Module &M, unsigned NumParts, CostType ModuleCost,
     if (!GO) continue;
     if (const auto *Func = llvm::dyn_cast<Function>(GO)) {
       Partitions[0].insert(Func);
+      AliasedFuncs.insert(Func);
+      SmallVector<const Function *> WorkListForAliasee({Func});
       if (Func->hasComdat()) {
         if (!ComdatMembers.count(Func->getComdat()))
           continue;
         for (const GlobalValue *ComdateGV : ComdatMembers[Func->getComdat()]) {
-          if (const Function *ComdateFunc = llvm::dyn_cast<Function>(ComdateGV))
+          if (const Function *ComdateFunc = llvm::dyn_cast<Function>(ComdateGV)) {
             Partitions[0].insert(ComdateFunc);
+            AliasedFuncs.insert(ComdateFunc);
+            WorkListForAliasee.push_back(ComdateFunc);
+          }
+        }
+      }
+      DenseSet<const Function *> Dependencies;
+      while (!WorkListForAliasee.empty()) {
+        const auto &CurFn = *WorkListForAliasee.pop_back_val();
+        for (auto &SCGNode : *SCG->at(&CurFn)) {
+          auto *Callee = SCGNode->getFunction();
+          if (Callee != Func) {
+            auto [It, Inserted] = Dependencies.insert(Callee);
+            if (Inserted && Callee->hasExactDefinition() && !Callee->isDeclaration()) {
+              WorkListForAliasee.push_back(Callee);
+              AliasedFuncs.insert(Callee);
+              Partitions[0].insert(Callee);
+              externalize(Callee);
+              externalFunction[Callee] = true;
+            }
+          }
         }
       }
     }
@@ -262,7 +282,6 @@ doPartitioning(Module &M, unsigned NumParts, CostType ModuleCost,
 
   return Partitions;
 }
-} // namespace
 
 void SplitModuleCG::calculateFunctionCosts() {
   ModuleCost = 0;
@@ -304,18 +323,33 @@ void SplitModuleCG::getLargeFunction() {
   }
 }
 
+// Refer to OptimizeGlobalAliases's handling method
 void SplitModuleCG::DealWithAlias() {
-  for (GlobalAlias &GA : M.aliases()) {
-    GlobalObject *GO = GA.getAliaseeObject();
-    if (!GO) continue;
-    if (auto *Func = llvm::dyn_cast<Function>(GO)) {
-      if (GA.getType() != Func->getType()) {
-        Constant *CastFunc = ConstantExpr::getBitCast(Func, GA.getType());
-        GA.replaceAllUsesWith(CastFunc);
-      } else {
-        GA.replaceAllUsesWith(Func);
-      }
-    }
+  // Return whether GV is explicitly or implicitly dso_local and not replaceable
+  // by another definition in the current linkage unit.
+  auto IsModuleLocal = [](GlobalValue &GV) {
+    return !GlobalValue::isInterposableLinkage(GV.getLinkage()) &&
+           (GV.isDSOLocal() || GV.isImplicitDSOLocal());
+  };
+
+  for (GlobalAlias &GA : llvm::make_early_inc_range(M.aliases())) {
+    if (!GA.hasName() && !GA.isDeclaration() && !GA.hasLocalLinkage())
+      GA.setLinkage(GlobalValue::InternalLinkage);
+    if (GA.use_empty())
+      continue;
+
+    // If the alias can change at link time, nothing can be done.
+    if (!IsModuleLocal(GA))
+      continue;
+    Constant *Aliasee = GA.getAliasee();
+    GlobalValue *Target = dyn_cast<GlobalValue>(Aliasee->stripPointerCasts());
+    if (!Target || !IsModuleLocal(*Target))
+      continue;
+
+    Constant *Replacement = (Aliasee->getType() == GA.getType()) 
+                            ? Aliasee 
+                            : ConstantExpr::getBitCast(Aliasee, GA.getType());
+    GA.replaceNonMetadataUsesWith(Replacement);
   }
 }
 
@@ -609,6 +643,8 @@ void SplitModuleCG::SplitModule(TargetMachine *TM,
   }
   for (GlobalVariable &GV : M.globals())
     externalize(&GV);
+  for (GlobalAlias &GA : M.aliases())
+    externalize(&GA);
   DealWithAlias();
   DealWithIFunc();
   SmallVector<FunctionWithDependencies> WorkList;
@@ -666,7 +702,7 @@ void SplitModuleCG::SplitModule(TargetMachine *TM,
   }
 
   auto Partitions =
-      doPartitioning(M, N, ModuleCost, FuncsCosts, WorkList, EntryFuncs, ComdatMembers);
+      doPartitioning(M, N, ModuleCost, FuncsCosts, WorkList);
   assert(Partitions.size() == N);
   auto &VTableRecord = SCG->getVTableRecord();
   auto GTVPartitions = doGValuePartitioning(VTableRecord, Partitions, N);
@@ -675,9 +711,6 @@ void SplitModuleCG::SplitModule(TargetMachine *TM,
       if (!GV->isDeclaration() && GV->hasExternalLinkage())
         ExternalGValues[GV] = true;
     }
-  }
-  for (auto GVsItem : ExternalGValues) {
-    processVTableElements(M.getGlobalVariable(GVsItem.first->getName()));
   }
   auto GVPartitions = doGValuePartitioning(GVRecord, Partitions, N);
   auto GIPartitions = doGValuePartitioning(IfuncRecord, Partitions, N);
@@ -694,7 +727,7 @@ void SplitModuleCG::SplitModule(TargetMachine *TM,
 
   unsigned TotalFnImpls = 0;
 
-  auto dealWithMpart = [&](std::unique_ptr<Module> MPart) {
+  auto dealWithMpart = [&](std::unique_ptr<Module> MPart, unsigned I) {
     DealWithDuplicateDebugInfo(*MPart);
     DealWithDeclareDebugInfo(*MPart);
     // collect symbols to rename
@@ -721,6 +754,14 @@ void SplitModuleCG::SplitModule(TargetMachine *TM,
       std::lock_guard<std::mutex> lock(mtx);
       for (auto &func : MPart->functions()) {
         auto Fn = M.getFunction(func.getName());
+        if (externalFunction.count(Fn) && AliasedFuncs.count(Fn)) {
+          if (I != 0 && !func.isDeclaration()) {
+            func.setLinkage(GlobalValue::AvailableExternallyLinkage);
+            func.setSubprogram(nullptr);
+            func.setComdat(nullptr);
+            continue;
+          }
+        }
         if (externalFunction.count(Fn) && !func.isDeclaration() &&
             (HotFuncs.count(Fn) || !CloneHotExternalOnly)) {
           if (!externalFunction[Fn]) {
@@ -823,7 +864,7 @@ void SplitModuleCG::SplitModule(TargetMachine *TM,
           });
         }
 
-        MPart = dealWithMpart(std::move(MPart));
+        MPart = dealWithMpart(std::move(MPart), I);
 
         {
           std::lock_guard<std::mutex> lock(mtx);
@@ -884,7 +925,7 @@ void SplitModuleCG::SplitModule(TargetMachine *TM,
             return I == 0;
           }));
         LLVM_DEBUG(dbgs() << "Clone module  " << I << " over.\n");
-        MPart = dealWithMpart(std::move(MPart));
+        MPart = dealWithMpart(std::move(MPart), I);
         
       {
         std::lock_guard<std::mutex> lock(mtx);

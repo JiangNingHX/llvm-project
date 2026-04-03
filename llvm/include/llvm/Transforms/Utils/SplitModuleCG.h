@@ -280,6 +280,7 @@ private:
   const llvm::lto::Config &C;
   DenseMap<const Comdat *, DenseSet<const GlobalValue *>> ComdatMembers;
   DenseSet<const GlobalValue *> SpecialGV;
+  DenseSet<const Function *> AliasedFuncs;
 
   void calculateEntryFuncs();
   void calculateFunctionCosts();
@@ -292,6 +293,11 @@ private:
   void UpdateFWDInfo(llvm::FunctionWithDependencies &FWD);
   bool shouldCloneFunction(const Function *Fn);
   void DealWithDuplicateDebugInfo(Module &MPart);
+  std::vector<DenseSet<const Function *>>
+               doPartitioning(Module &M, unsigned NumParts,
+                              CostType ModuleCost,
+                              const DenseMap<const Function *, CostType> &FnCosts,
+                              const SmallVector<FunctionWithDependencies> &WorkList);
 };
 
 } // end namespace llvm
