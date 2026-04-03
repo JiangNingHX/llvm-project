@@ -1,0 +1,37 @@
+## This test checks that --dwp keeps unit-local type references reachable only
+## through retained declaration DIEs.
+
+# RUN: llc -mtriple=x86_64-unknown-linux-gnu -split-dwarf-file=%t.dwo -filetype=obj -o %t.o < %p/Inputs/dwp-retained-reference-closure.ll
+# RUN: llvm-dwp %t.o -o %t.dwp
+# RUN: llvm-dwarfutil --dwp %t.dwp %t.o %t.out.dwp
+# RUN: llvm-dwarfdump --verify %t.out.dwp
+# RUN: llvm-dwarfdump --debug-info %t.out.dwp | FileCheck %s
+
+# CHECK-LABEL: .debug_info.dwo contents:
+# CHECK: [[TYPE:0x[0-9a-f]+]]:   DW_TAG_structure_type
+# CHECK: DW_AT_containing_type{{.*}}([[TYPE]] "A")
+
+# CHECK: [[DECL_F:0x[0-9a-f]+]]:     DW_TAG_subprogram
+# CHECK: DW_AT_name{{.*}}("f")
+# CHECK: DW_AT_declaration{{.*}}(true)
+# CHECK: DW_AT_object_pointer{{.*}}([[PARAM_F:0x[0-9a-f]+]])
+# CHECK: DW_AT_containing_type{{.*}}([[TYPE]] "A")
+# CHECK: [[PARAM_F]]:       DW_TAG_formal_parameter
+# CHECK: DW_AT_type{{.*}}([[THIS_PTR:0x[0-9a-f]+]] "A *")
+
+# CHECK: [[DECL_G:0x[0-9a-f]+]]:     DW_TAG_subprogram
+# CHECK: DW_AT_name{{.*}}("g")
+# CHECK: DW_AT_declaration{{.*}}(true)
+# CHECK: DW_AT_object_pointer{{.*}}([[PARAM_G:0x[0-9a-f]+]])
+# CHECK: DW_AT_containing_type{{.*}}([[TYPE]] "A")
+# CHECK: [[PARAM_G]]:       DW_TAG_formal_parameter
+# CHECK: DW_AT_type{{.*}}([[THIS_PTR]] "A *")
+
+# CHECK: [[THIS_PTR]]:   DW_TAG_pointer_type
+# CHECK: DW_AT_type{{.*}}([[TYPE]] "A")
+
+# CHECK: DW_TAG_subprogram
+# CHECK: DW_AT_specification{{.*}}([[DECL_F]] "_ZN1A1fEv")
+
+# CHECK: DW_TAG_subprogram
+# CHECK: DW_AT_specification{{.*}}([[DECL_G]] "_ZN1A1gEv")

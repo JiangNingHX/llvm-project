@@ -99,6 +99,8 @@ static bool shouldRewriteRetainedReferenceAttr(dwarf::Attribute Attr) {
   case dwarf::DW_AT_type:
   case dwarf::DW_AT_specification:
   case dwarf::DW_AT_abstract_origin:
+  case dwarf::DW_AT_object_pointer:
+  case dwarf::DW_AT_containing_type:
     return true;
   default:
     return false;
@@ -943,12 +945,14 @@ computeRetainedDIEOffsetMap(const DWARFDie &UnitDIE, StringRef InputInfoContents
                             const DenseMap<uint64_t, uint64_t> &DirectStringOffsetRemap,
                             const DenseMap<uint64_t, uint64_t> &RangeListOffsetRemap) {
   DenseMap<uint64_t, uint64_t> Offsets;
+  const uint64_t UnitOffset = UnitDIE.getDwarfUnit()->getOffset();
+  const uint64_t HeaderSize = UnitDIE.getDwarfUnit()->getHeaderSize();
   for (const uint64_t Offset : RetainedOffsets)
-    Offsets[Offset] = Offset - UnitDIE.getDwarfUnit()->getOffset();
+    Offsets[UnitOffset + Offset] = Offset;
 
   for (unsigned Iter = 0; Iter != 8; ++Iter) {
     DenseMap<uint64_t, uint64_t> NewOffsets;
-    uint64_t NextOffset = 0;
+    uint64_t NextOffset = HeaderSize;
     if (Error Err = assignRetainedDIEOffsets(UnitDIE, InputInfoContents,
                                              RetainedOffsets, Offsets,
                                              StringIndexRemap,
@@ -1738,8 +1742,11 @@ static void addReferencedDIEClosure(const DWARFDie &RootDie,
     if (!ExpandedOffsets.insert(getUnitRelativeDIEOffset(Die)).second)
       continue;
 
-    for (dwarf::Attribute Attr : {dwarf::DW_AT_type, dwarf::DW_AT_specification,
-                                  dwarf::DW_AT_abstract_origin}) {
+    for (dwarf::Attribute Attr : {dwarf::DW_AT_type,
+                                  dwarf::DW_AT_specification,
+                                  dwarf::DW_AT_abstract_origin,
+                                  dwarf::DW_AT_object_pointer,
+                                  dwarf::DW_AT_containing_type}) {
       DWARFDie ReferencedDie = Die.getAttributeValueAsReferencedDie(Attr);
       if (!ReferencedDie)
         continue;
@@ -1751,6 +1758,43 @@ static void addReferencedDIEClosure(const DWARFDie &RootDie,
 
     for (DWARFDie Child : reverse(Die.children()))
       Worklist.push_back(Child);
+  }
+}
+
+// Some retained declaration DIEs are only reached via unit-local ref attrs
+// hanging off other retained declarations. Saturate the retained set so those
+// references are rewritten to live DIEs instead of dangling after GC.
+static void expandRetainedReferenceClosure(const DWARFDie &UnitDIE,
+                                           SkeletonUnitInfo &Info) {
+  DenseSet<uint64_t> SeenOffsets(Info.RetainedDIEOffsets.begin(),
+                                 Info.RetainedDIEOffsets.end());
+
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
+    SmallVector<uint64_t, 16> Snapshot(Info.RetainedDIEOffsets.begin(),
+                                       Info.RetainedDIEOffsets.end());
+    for (uint64_t Offset : Snapshot) {
+      DWARFDie Die = getDIEForUnitRelativeOffset(UnitDIE, Offset);
+      if (!Die || Die.isNULL())
+        continue;
+
+      for (dwarf::Attribute Attr : {dwarf::DW_AT_type,
+                                    dwarf::DW_AT_specification,
+                                    dwarf::DW_AT_abstract_origin,
+                                    dwarf::DW_AT_object_pointer,
+                                    dwarf::DW_AT_containing_type}) {
+        DWARFDie ReferencedDie = Die.getAttributeValueAsReferencedDie(Attr);
+        if (!ReferencedDie)
+          continue;
+
+        size_t PrevSize = Info.RetainedDIEOffsets.size();
+        addRetainedDIEChain(ReferencedDie, Info, SeenOffsets);
+        addRetainedDIESubtree(ReferencedDie, Info, SeenOffsets);
+        if (Info.RetainedDIEOffsets.size() != PrevSize)
+          Changed = true;
+      }
+    }
   }
 }
 
@@ -2612,6 +2656,7 @@ static Error resolveSplitUnitInfo(DWARFUnit &SkeletonUnit,
                 Info.DWOId, toString(std::move(Err)))
             .str()
             .c_str());
+  expandRetainedReferenceClosure(SplitUnitDie, Info);
 
   finalizeLiveUnitInfo(Info);
   return Error::success();
