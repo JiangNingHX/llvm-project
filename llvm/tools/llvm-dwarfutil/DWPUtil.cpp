@@ -9,6 +9,7 @@
 #include "DWPUtil.h"
 #include "Error.h"
 #include "llvm/ADT/AddressRanges.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -24,9 +25,12 @@
 #include "llvm/Object/Binary.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/LEB128.h"
-#include "llvm/Support/Endian.h"
+#include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/Threading.h"
+#include <mutex>
 #include <system_error>
 
 using namespace llvm;
@@ -111,24 +115,209 @@ static std::string getDWPSectionNameForError(DWARFSectionKind Kind) {
   return std::string(toString(Kind));
 }
 
-static Expected<std::optional<StringRef>> getRewrittenUnitContents(
-    DWARFSectionKind Kind, uint64_t DWOId,
-    const DenseMap<DWARFSectionKind, DenseMap<uint64_t, std::string> *>
-        &RewrittenUnitContentsByKind,
-    StringRef Context) {
-  auto MapIt = RewrittenUnitContentsByKind.find(Kind);
-  if (MapIt == RewrittenUnitContentsByKind.end())
-    return std::optional<StringRef>();
+struct RetainedDWPRewriteUnitAnalysis {
+  uint64_t DWOId = 0;
+  DenseMap<uint64_t, uint64_t> StringIndexRemap;
+  DenseMap<uint64_t, uint64_t> DirectStringOffsetRemap;
+  DenseMap<uint64_t, uint64_t> LocationOffsetRemap;
+  DenseMap<uint64_t, uint64_t> RangeListOffsetRemap;
+};
 
-  auto ContentsIt = MapIt->second->find(DWOId);
-  if (ContentsIt == MapIt->second->end())
+struct RetainedDWPRewriteUnitContents {
+  uint64_t DWOId = 0;
+  std::string Info;
+  std::string Abbrev;
+  std::string StringOffsets;
+  std::string Loc;
+  std::string Rnglists;
+};
+
+struct RetainedDWPRewriteUnitDescriptor {
+  uint64_t DWOId = 0;
+  uint64_t UnitOffset = 0;
+  size_t PackageUnitIndex = 0;
+  size_t SortedUnitIndex = 0;
+};
+
+struct LoadedRetainedDWPUnit {
+  explicit LoadedRetainedDWPUnit(OwningBinary<Binary> DWPBinary)
+      : DWPBinary(std::move(DWPBinary)) {}
+
+  OwningBinary<Binary> DWPBinary;
+  std::unique_ptr<DWARFContext> DWPContext;
+  DenseMap<DWARFSectionKind, StringRef> SectionContents;
+  StringRef DebugStrContents;
+  DWARFDie UnitDIE;
+};
+
+static Error collectDWPSectionContents(
+    const ObjectFile &DWPObject, DenseMap<DWARFSectionKind, StringRef> &SectionContents,
+    StringRef &DebugStrContents,
+    DenseMap<DWARFSectionKind, uint64_t> *SectionSizes = nullptr) {
+  for (const object::SectionRef &Section : DWPObject.sections()) {
+    Expected<StringRef> NameOrErr = Section.getName();
+    if (!NameOrErr)
+      return NameOrErr.takeError();
+    Expected<StringRef> ContentsOrErr = Section.getContents();
+    if (!ContentsOrErr)
+      return ContentsOrErr.takeError();
+    if (*NameOrErr == ".debug_str.dwo")
+      DebugStrContents = *ContentsOrErr;
+
+    for (DWARFSectionKind Kind : {DW_SECT_INFO, DW_SECT_ABBREV,
+                                  DW_SECT_STR_OFFSETS, DW_SECT_RNGLISTS,
+                                  DW_SECT_EXT_LOC}) {
+      if (std::optional<StringRef> ExpectedName = getDWPSectionName(Kind);
+          ExpectedName && *NameOrErr == *ExpectedName) {
+        if (SectionSizes)
+          (*SectionSizes)[Kind] = Section.getSize();
+        SectionContents[Kind] = *ContentsOrErr;
+        break;
+      }
+    }
+  }
+  return Error::success();
+}
+
+static Expected<DWARFUnit *>
+getRetainedDWPCompileUnit(DWARFContext &DWPContext,
+                          const RetainedDWPRewriteUnitDescriptor &Descriptor) {
+  size_t PackageIndex = 0;
+  for (const std::unique_ptr<DWARFUnit> &CU : DWPContext.dwo_compile_units()) {
+    if (PackageIndex++ != Descriptor.PackageUnitIndex)
+      continue;
+
+    std::optional<uint64_t> CandidateId = CU->getDWOId();
+    DWARFDie UnitDIE = CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false);
+    if (!CandidateId || *CandidateId != Descriptor.DWOId ||
+        !UnitDIE || UnitDIE.getOffset() != Descriptor.UnitOffset)
+      return createStringError(
+          std::errc::invalid_argument,
+          formatv("retained package unit descriptor mismatch for DWO_id {0:x16}",
+                  Descriptor.DWOId)
+              .str()
+              .c_str());
+
+    return CU.get();
+  }
+
+  return createStringError(
+      std::errc::invalid_argument,
+      formatv("package unit index {0} is out of bounds for retained DWO_id "
+              "{1:x16}",
+              Descriptor.PackageUnitIndex, Descriptor.DWOId)
+          .str()
+          .c_str());
+}
+
+static Expected<LoadedRetainedDWPUnit>
+loadRetainedDWPUnitForRewrite(StringRef DWPFileName,
+                              const RetainedDWPRewriteUnitDescriptor &Descriptor) {
+  Expected<OwningBinary<Binary>> DWPBinOrErr = openBinary(DWPFileName);
+  if (!DWPBinOrErr)
+    return DWPBinOrErr.takeError();
+
+  LoadedRetainedDWPUnit Loaded(std::move(*DWPBinOrErr));
+  auto *DWPObject = cast<ObjectFile>(Loaded.DWPBinary.getBinary());
+  Loaded.DWPContext = DWARFContext::create(*DWPObject);
+  if (!Loaded.DWPContext->isDWP())
     return createStringError(
         std::errc::invalid_argument,
-        formatv("missing rewritten {0} {1} for DWO_id {2:x16}",
-                getDWPSectionNameForError(Kind), Context, DWOId)
+        formatv("file '{0}' is not a DWARF package file", DWPFileName)
             .str()
             .c_str());
-  return std::optional<StringRef>(StringRef(ContentsIt->second));
+
+  if (Error Err = collectDWPSectionContents(*DWPObject, Loaded.SectionContents,
+                                            Loaded.DebugStrContents))
+    return std::move(Err);
+
+  Expected<DWARFUnit *> CUOrErr =
+      getRetainedDWPCompileUnit(*Loaded.DWPContext, Descriptor);
+  if (!CUOrErr)
+    return CUOrErr.takeError();
+
+  Loaded.UnitDIE = (*CUOrErr)->getUnitDIE(/*ExtractUnitDIEOnly=*/false);
+  if (!Loaded.UnitDIE)
+    return createStringError(
+        std::errc::invalid_argument,
+        formatv("unable to load retained package unit DIE for DWO_id {0:x16}",
+                Descriptor.DWOId)
+            .str()
+            .c_str());
+
+  return Loaded;
+}
+
+static Expected<SmallVector<RetainedDWPRewriteUnitDescriptor, 4>>
+buildRetainedDWPRewriteUnitDescriptors(
+    DWARFContext &DWPContext, ArrayRef<RetainedDWPPackageUnitInfo> RetainedUnits) {
+  DenseMap<uint64_t, size_t> SortedUnitIndicesByOffset;
+  for (size_t I = 0; I != RetainedUnits.size(); ++I)
+    SortedUnitIndicesByOffset.try_emplace(RetainedUnits[I].Unit.UnitOffset, I);
+
+  SmallVector<RetainedDWPRewriteUnitDescriptor, 4> Descriptors;
+  Descriptors.reserve(RetainedUnits.size());
+  size_t PackageIndex = 0;
+  for (const std::unique_ptr<DWARFUnit> &CU : DWPContext.dwo_compile_units()) {
+    DWARFDie UnitDIE = CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false);
+    if (!UnitDIE) {
+      ++PackageIndex;
+      continue;
+    }
+
+    auto It = SortedUnitIndicesByOffset.find(UnitDIE.getOffset());
+    if (It == SortedUnitIndicesByOffset.end()) {
+      ++PackageIndex;
+      continue;
+    }
+
+    const RetainedDWPPackageUnitInfo &Unit = RetainedUnits[It->second];
+    std::optional<uint64_t> DWOId = CU->getDWOId();
+    if (!DWOId || *DWOId != Unit.Unit.DWOId)
+      return createStringError(
+          std::errc::invalid_argument,
+          formatv("retained package unit mismatch at offset 0x{0:x}",
+                  Unit.Unit.UnitOffset)
+              .str()
+              .c_str());
+
+    RetainedDWPRewriteUnitDescriptor &Descriptor = Descriptors.emplace_back();
+    Descriptor.DWOId = *DWOId;
+    Descriptor.UnitOffset = UnitDIE.getOffset();
+    Descriptor.PackageUnitIndex = PackageIndex;
+    Descriptor.SortedUnitIndex = It->second;
+    ++PackageIndex;
+  }
+
+  if (Descriptors.size() != RetainedUnits.size())
+    return createStringError(
+        std::errc::invalid_argument,
+        formatv("unable to reconstruct retained package order: expected {0} "
+                "units, found {1}",
+                RetainedUnits.size(), Descriptors.size())
+            .str()
+            .c_str());
+
+  return Descriptors;
+}
+
+static std::optional<StringRef>
+getRewrittenUnitContents(DWARFSectionKind Kind,
+                         const RetainedDWPRewriteUnitContents &Contents) {
+  switch (Kind) {
+  case DW_SECT_INFO:
+    return StringRef(Contents.Info);
+  case DW_SECT_ABBREV:
+    return StringRef(Contents.Abbrev);
+  case DW_SECT_STR_OFFSETS:
+    return StringRef(Contents.StringOffsets);
+  case DW_SECT_RNGLISTS:
+    return StringRef(Contents.Rnglists);
+  case DW_SECT_EXT_LOC:
+    return StringRef(Contents.Loc);
+  default:
+    return std::nullopt;
+  }
 }
 
 static Error validateRewrittenUnitContentsSize(DWARFSectionKind Kind,
@@ -1447,33 +1636,48 @@ buildRetainedDirectStringOffsetRemap(const DWPLinkMap &LinkMap,
   return Remap;
 }
 
+static SmallVector<uint64_t, 8>
+getSortedRetainedDirectStringOffsets(
+    const DenseMap<uint64_t, uint64_t> &DirectStringOffsetRemap) {
+  SmallVector<uint64_t, 8> Offsets;
+  Offsets.reserve(DirectStringOffsetRemap.size());
+  for (const auto &OffsetIt : DirectStringOffsetRemap)
+    Offsets.push_back(OffsetIt.first);
+  llvm::sort(Offsets);
+  return Offsets;
+}
+
 static Expected<RetainedDWPStringSectionInfo> buildRetainedDWPStringSection(
-    DWARFContext &DWPContext, const DWPLinkMap &LinkMap,
+    DWARFContext &DWPContext,
+    ArrayRef<RetainedDWPRewriteUnitDescriptor> Descriptors,
     StringRef InputStringOffsetContents, StringRef InputStringContents,
-    const DenseMap<uint64_t, DenseMap<uint64_t, uint64_t>> &StringIndexRemaps,
-    const DenseMap<uint64_t, DenseMap<uint64_t, uint64_t>>
-        &DirectStringOffsetRemaps) {
+    ArrayRef<RetainedDWPRewriteUnitAnalysis> UnitAnalyses) {
   RetainedDWPStringSectionInfo Result;
   StringMap<uint64_t> StringOffsetsByValue;
 
-  for (const std::unique_ptr<DWARFUnit> &CU : DWPContext.dwo_compile_units()) {
-    std::optional<uint64_t> DWOId = CU->getDWOId();
-    if (!DWOId || !LinkMap.findLinkedUnit(*DWOId))
-      continue;
+  assert(Descriptors.size() == UnitAnalyses.size() &&
+         "retained unit analyses must align with retained units");
+  for (const RetainedDWPRewriteUnitDescriptor &Descriptor : Descriptors) {
+    uint64_t DWOId = Descriptor.DWOId;
+    const RetainedDWPRewriteUnitAnalysis &Analysis =
+        UnitAnalyses[Descriptor.SortedUnitIndex];
+    assert(Analysis.DWOId == DWOId &&
+           "retained unit analysis must match retained unit order");
 
-    auto RemapIt = StringIndexRemaps.find(*DWOId);
-    if (RemapIt == StringIndexRemaps.end())
-      continue;
+    Expected<DWARFUnit *> CUOrErr =
+        getRetainedDWPCompileUnit(DWPContext, Descriptor);
+    if (!CUOrErr)
+      return CUOrErr.takeError();
 
     Expected<SmallVector<std::pair<uint64_t, uint64_t>, 8>> IndexedEntriesOrErr =
         collectRetainedStringOffsetsInNewIndexOrder(
-            CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false),
-            InputStringOffsetContents, RemapIt->second);
+            (*CUOrErr)->getUnitDIE(/*ExtractUnitDIEOnly=*/false),
+            InputStringOffsetContents, Analysis.StringIndexRemap);
     if (!IndexedEntriesOrErr)
       return IndexedEntriesOrErr.takeError();
 
     DenseMap<uint64_t, uint64_t> &StringOffsetRemap =
-        Result.StringOffsetRemapsByDWOId[*DWOId];
+        Result.StringOffsetRemapsByDWOId[DWOId];
     for (const auto &[NewIndex, OldStringOffset] : *IndexedEntriesOrErr) {
       (void)NewIndex;
       if (StringOffsetRemap.contains(OldStringOffset))
@@ -1493,11 +1697,8 @@ static Expected<RetainedDWPStringSectionInfo> buildRetainedDWPStringSection(
       StringOffsetRemap[OldStringOffset] = ValueIt->second;
     }
 
-    auto DirectIt = DirectStringOffsetRemaps.find(*DWOId);
-    if (DirectIt == DirectStringOffsetRemaps.end())
-      continue;
-    for (const auto &OffsetIt : DirectIt->second) {
-      uint64_t OldStringOffset = OffsetIt.first;
+    for (uint64_t OldStringOffset :
+         getSortedRetainedDirectStringOffsets(Analysis.DirectStringOffsetRemap)) {
       if (StringOffsetRemap.contains(OldStringOffset))
         continue;
 
@@ -2070,158 +2271,284 @@ collectRetainedDWPPackageUnits(const DWPLinkMap &LinkMap, StringRef DWPFileName)
   return PackageUnits;
 }
 
-Expected<RetainedDWPRewritePlan>
-collectRetainedDWPRewritePlan(const DWPLinkMap &LinkMap, StringRef DWPFileName) {
-  Expected<SmallVector<RetainedDWPPackageUnitInfo, 4>> PackageUnitsOrErr =
-      collectRetainedDWPPackageUnits(LinkMap, DWPFileName);
-  if (!PackageUnitsOrErr)
-    return PackageUnitsOrErr.takeError();
+static bool shouldUseRetainedDWPRewriteParallelism(const Options &Options,
+                                                   size_t NumUnits) {
+  if (!Options.NumThreadsExplicit || NumUnits <= 1)
+    return false;
+  return Options.NumThreads == 0 || Options.NumThreads > 1;
+}
 
-  Expected<OwningBinary<Binary>> DWPBinOrErr = openBinary(DWPFileName);
+template <typename ItemT, typename ResultT, typename FnT>
+static Error executeRetainedDWPUnitTasks(ArrayRef<ItemT> Items,
+                                         const Options &Options,
+                                         MutableArrayRef<ResultT> Results,
+                                         FnT &&Fn) {
+  assert(Items.size() == Results.size() &&
+         "retained unit task results must align with retained units");
+
+  if (!shouldUseRetainedDWPRewriteParallelism(Options, Items.size())) {
+    for (size_t I = 0; I != Items.size(); ++I) {
+      Expected<ResultT> ResultOrErr = Fn(I, Items[I]);
+      if (!ResultOrErr)
+        return ResultOrErr.takeError();
+      Results[I] = std::move(*ResultOrErr);
+    }
+    return Error::success();
+  }
+
+  unsigned ThreadCount = Options.NumThreads > 0
+                             ? static_cast<unsigned>(Options.NumThreads)
+                             : 0;
+  DefaultThreadPool Pool(hardware_concurrency(ThreadCount));
+  ThreadPoolTaskGroup Group(Pool);
+  std::mutex ErrorMutex;
+  Error Err = Error::success();
+  for (size_t I = 0; I != Items.size(); ++I) {
+    Group.async([&, I] {
+      Expected<ResultT> ResultOrErr = Fn(I, Items[I]);
+      if (!ResultOrErr) {
+        std::lock_guard<std::mutex> Guard(ErrorMutex);
+        Err = joinErrors(std::move(Err), ResultOrErr.takeError());
+        return;
+      }
+      Results[I] = std::move(*ResultOrErr);
+    });
+  }
+  Group.wait();
+  return std::move(Err);
+}
+
+static Expected<RetainedDWPRewriteUnitAnalysis>
+analyzeRetainedDWPRewriteUnit(const DWPLinkMap &LinkMap, const DWARFDie &UnitDIE,
+                              StringRef LocContents,
+                              StringRef RnglistsContents) {
+  RetainedDWPRewriteUnitAnalysis Analysis;
+  std::optional<uint64_t> DWOId = getUnitDWOId(UnitDIE);
+  if (!DWOId)
+    return createStringError(std::errc::invalid_argument,
+                             "retained package unit DIE is missing DWO_id");
+  Analysis.DWOId = *DWOId;
+
+  Expected<DenseMap<uint64_t, uint64_t>> StringIndexRemapOrErr =
+      buildRetainedStringIndexRemap(LinkMap, UnitDIE);
+  if (!StringIndexRemapOrErr)
+    return StringIndexRemapOrErr.takeError();
+  Analysis.StringIndexRemap = std::move(*StringIndexRemapOrErr);
+
+  Expected<DenseMap<uint64_t, uint64_t>> DirectStringOffsetRemapOrErr =
+      buildRetainedDirectStringOffsetRemap(LinkMap, UnitDIE);
+  if (!DirectStringOffsetRemapOrErr)
+    return DirectStringOffsetRemapOrErr.takeError();
+  Analysis.DirectStringOffsetRemap = std::move(*DirectStringOffsetRemapOrErr);
+
+  Expected<DenseMap<uint64_t, uint64_t>> LocationOffsetRemapOrErr =
+      buildRetainedLocationOffsetRemap(LinkMap, UnitDIE, LocContents);
+  if (!LocationOffsetRemapOrErr)
+    return LocationOffsetRemapOrErr.takeError();
+  Analysis.LocationOffsetRemap = std::move(*LocationOffsetRemapOrErr);
+
+  Expected<DenseMap<uint64_t, uint64_t>> RangeListOffsetRemapOrErr =
+      buildRetainedRangeListOffsetRemap(LinkMap, UnitDIE, RnglistsContents);
+  if (!RangeListOffsetRemapOrErr)
+    return RangeListOffsetRemapOrErr.takeError();
+  Analysis.RangeListOffsetRemap = std::move(*RangeListOffsetRemapOrErr);
+
+  return Analysis;
+}
+
+static Expected<RetainedDWPRewriteUnitAnalysis>
+analyzeRetainedDWPRewriteUnitTask(
+    const DWPLinkMap &LinkMap, StringRef DWPFileName,
+    const RetainedDWPRewriteUnitDescriptor &Descriptor) {
+  Expected<LoadedRetainedDWPUnit> LoadedOrErr =
+      loadRetainedDWPUnitForRewrite(DWPFileName, Descriptor);
+  if (!LoadedOrErr)
+    return LoadedOrErr.takeError();
+
+  return analyzeRetainedDWPRewriteUnit(
+      LinkMap, LoadedOrErr->UnitDIE,
+      LoadedOrErr->SectionContents.lookup(DW_SECT_EXT_LOC),
+      LoadedOrErr->SectionContents.lookup(DW_SECT_RNGLISTS));
+}
+
+static Expected<RetainedDWPRewriteUnitContents>
+rewriteRetainedDWPUnit(const DWPLinkMap &LinkMap, const DWARFDie &UnitDIE,
+                       const DenseMap<DWARFSectionKind, StringRef> &SectionContents,
+                       const RetainedDWPRewriteUnitAnalysis &Analysis,
+                       const DenseMap<uint64_t, uint64_t> &StringOffsetRemap) {
+  RetainedDWPRewriteUnitContents Contents;
+  Contents.DWOId = Analysis.DWOId;
+
+  Expected<std::string> RewrittenInfoOrErr = rewriteRetainedDWPInfoUnit(
+      LinkMap, UnitDIE, SectionContents.lookup(DW_SECT_INFO),
+      Analysis.StringIndexRemap, Analysis.LocationOffsetRemap,
+      StringOffsetRemap, Analysis.RangeListOffsetRemap);
+  if (!RewrittenInfoOrErr)
+    return RewrittenInfoOrErr.takeError();
+  Contents.Info = std::move(*RewrittenInfoOrErr);
+
+  Expected<std::string> RewrittenAbbrevOrErr = rewriteRetainedDWPAbbrevUnit(
+      LinkMap, UnitDIE, SectionContents.lookup(DW_SECT_ABBREV));
+  if (!RewrittenAbbrevOrErr)
+    return RewrittenAbbrevOrErr.takeError();
+  Contents.Abbrev = std::move(*RewrittenAbbrevOrErr);
+
+  Expected<std::string> RewrittenStrOffsetsOrErr =
+      rewriteRetainedDWPStringOffsetsUnit(UnitDIE,
+                                          SectionContents.lookup(DW_SECT_STR_OFFSETS),
+                                          Analysis.StringIndexRemap,
+                                          StringOffsetRemap);
+  if (!RewrittenStrOffsetsOrErr)
+    return RewrittenStrOffsetsOrErr.takeError();
+  Contents.StringOffsets = std::move(*RewrittenStrOffsetsOrErr);
+
+  Expected<std::string> RewrittenLocOrErr = rewriteRetainedDWPLocUnit(
+      LinkMap, UnitDIE, SectionContents.lookup(DW_SECT_EXT_LOC),
+      Analysis.LocationOffsetRemap);
+  if (!RewrittenLocOrErr)
+    return RewrittenLocOrErr.takeError();
+  Contents.Loc = std::move(*RewrittenLocOrErr);
+
+  Expected<std::string> RewrittenRnglistsOrErr = rewriteRetainedDWPRnglistsUnit(
+      LinkMap, UnitDIE, SectionContents.lookup(DW_SECT_RNGLISTS),
+      Analysis.RangeListOffsetRemap);
+  if (!RewrittenRnglistsOrErr)
+    return RewrittenRnglistsOrErr.takeError();
+  Contents.Rnglists = std::move(*RewrittenRnglistsOrErr);
+
+  return Contents;
+}
+
+static Expected<RetainedDWPRewriteUnitContents>
+rewriteRetainedDWPUnitTask(const DWPLinkMap &LinkMap, StringRef DWPFileName,
+                           const RetainedDWPRewriteUnitDescriptor &Descriptor,
+                           const RetainedDWPRewriteUnitAnalysis &Analysis,
+                           const DenseMap<uint64_t, uint64_t> &StringOffsetRemap) {
+  Expected<LoadedRetainedDWPUnit> LoadedOrErr =
+      loadRetainedDWPUnitForRewrite(DWPFileName, Descriptor);
+  if (!LoadedOrErr)
+    return LoadedOrErr.takeError();
+
+  return rewriteRetainedDWPUnit(LinkMap, LoadedOrErr->UnitDIE,
+                                LoadedOrErr->SectionContents, Analysis,
+                                StringOffsetRemap);
+}
+
+Expected<RetainedDWPRewritePlan>
+collectRetainedDWPRewritePlan(const DWPLinkMap &LinkMap, const Options &Options) {
+  Expected<OwningBinary<Binary>> DWPBinOrErr = openBinary(Options.DWPFileName);
   if (!DWPBinOrErr)
     return DWPBinOrErr.takeError();
   auto *DWPObject = cast<ObjectFile>(DWPBinOrErr->getBinary());
   std::unique_ptr<DWARFContext> DWPContext = DWARFContext::create(*DWPObject);
 
+  RetainedDWPRewritePlan Plan;
+  Plan.Units = LinkMap.RetainedPackageUnits;
+  bool UseParallel =
+      shouldUseRetainedDWPRewriteParallelism(Options, Plan.Units.size());
+
   DenseMap<DWARFSectionKind, uint64_t> SectionSizes;
   DenseMap<DWARFSectionKind, StringRef> SectionContents;
   StringRef DebugStrContents;
-  for (const object::SectionRef &Section : DWPObject->sections()) {
-    Expected<StringRef> NameOrErr = Section.getName();
-    if (!NameOrErr)
-      return NameOrErr.takeError();
-    Expected<StringRef> ContentsOrErr = Section.getContents();
-    if (!ContentsOrErr)
-      return ContentsOrErr.takeError();
-    if (*NameOrErr == ".debug_str.dwo") {
-      DebugStrContents = *ContentsOrErr;
+  if (Error Err = collectDWPSectionContents(*DWPObject, SectionContents,
+                                            DebugStrContents, &SectionSizes))
+    return std::move(Err);
+
+  Expected<SmallVector<RetainedDWPRewriteUnitDescriptor, 4>> DescriptorsOrErr =
+      buildRetainedDWPRewriteUnitDescriptors(*DWPContext, Plan.Units);
+  if (!DescriptorsOrErr)
+    return DescriptorsOrErr.takeError();
+  const SmallVector<RetainedDWPRewriteUnitDescriptor, 4> &Descriptors =
+      *DescriptorsOrErr;
+
+  SmallVector<RetainedDWPRewriteUnitAnalysis, 4> UnitAnalyses(Plan.Units.size());
+  if (UseParallel) {
+    SmallVector<RetainedDWPRewriteUnitAnalysis, 4> PackageOrderAnalyses(
+        Descriptors.size());
+    if (Error Err = executeRetainedDWPUnitTasks(
+            ArrayRef<RetainedDWPRewriteUnitDescriptor>(Descriptors), Options,
+            MutableArrayRef<RetainedDWPRewriteUnitAnalysis>(PackageOrderAnalyses),
+            [&](size_t, const RetainedDWPRewriteUnitDescriptor &Descriptor)
+                -> Expected<RetainedDWPRewriteUnitAnalysis> {
+              return analyzeRetainedDWPRewriteUnitTask(LinkMap,
+                                                       Options.DWPFileName,
+                                                       Descriptor);
+            }))
+      return std::move(Err);
+    for (size_t I = 0; I != Descriptors.size(); ++I)
+      UnitAnalyses[Descriptors[I].SortedUnitIndex] =
+          std::move(PackageOrderAnalyses[I]);
+  } else {
+    for (const RetainedDWPRewriteUnitDescriptor &Descriptor : Descriptors) {
+      Expected<DWARFUnit *> CUOrErr =
+          getRetainedDWPCompileUnit(*DWPContext, Descriptor);
+      if (!CUOrErr)
+        return CUOrErr.takeError();
+
+      Expected<RetainedDWPRewriteUnitAnalysis> AnalysisOrErr =
+          analyzeRetainedDWPRewriteUnit(
+              LinkMap, (*CUOrErr)->getUnitDIE(/*ExtractUnitDIEOnly=*/false),
+              SectionContents.lookup(DW_SECT_EXT_LOC),
+              SectionContents.lookup(DW_SECT_RNGLISTS));
+      if (!AnalysisOrErr)
+        return AnalysisOrErr.takeError();
+      UnitAnalyses[Descriptor.SortedUnitIndex] = std::move(*AnalysisOrErr);
     }
-
-    for (DWARFSectionKind Kind : {DW_SECT_INFO, DW_SECT_ABBREV,
-                                  DW_SECT_STR_OFFSETS, DW_SECT_RNGLISTS,
-                                  DW_SECT_EXT_LOC}) {
-      if (std::optional<StringRef> ExpectedName = getDWPSectionName(Kind);
-          ExpectedName && *NameOrErr == *ExpectedName) {
-        SectionSizes[Kind] = Section.getSize();
-        SectionContents[Kind] = *ContentsOrErr;
-        break;
-      }
-    }
-  }
-
-  DenseMap<uint64_t, std::string> RewrittenInfoUnitContents;
-  DenseMap<uint64_t, std::string> RewrittenAbbrevUnitContents;
-  DenseMap<uint64_t, std::string> RewrittenStringOffsetsUnitContents;
-  DenseMap<uint64_t, std::string> RewrittenLocUnitContents;
-  DenseMap<uint64_t, std::string> RewrittenRnglistsUnitContents;
-  DenseMap<DWARFSectionKind, DenseMap<uint64_t, std::string> *>
-      RewrittenUnitContentsByKind = {
-          {DW_SECT_INFO, &RewrittenInfoUnitContents},
-          {DW_SECT_ABBREV, &RewrittenAbbrevUnitContents},
-          {DW_SECT_STR_OFFSETS, &RewrittenStringOffsetsUnitContents},
-          {DW_SECT_EXT_LOC, &RewrittenLocUnitContents},
-          {DW_SECT_RNGLISTS, &RewrittenRnglistsUnitContents},
-      };
-  DenseMap<uint64_t, DenseMap<uint64_t, uint64_t>> StringIndexRemaps;
-  DenseMap<uint64_t, DenseMap<uint64_t, uint64_t>> DirectStringOffsetRemaps;
-  DenseMap<uint64_t, DenseMap<uint64_t, uint64_t>> StringOffsetRemaps;
-  DenseMap<uint64_t, DenseMap<uint64_t, uint64_t>> LocationOffsetRemaps;
-  DenseMap<uint64_t, DenseMap<uint64_t, uint64_t>> RangeListOffsetRemaps;
-  for (const std::unique_ptr<DWARFUnit> &CU : DWPContext->dwo_compile_units()) {
-    std::optional<uint64_t> DWOId = CU->getDWOId();
-    if (!DWOId || !LinkMap.findLinkedUnit(*DWOId))
-      continue;
-
-    Expected<DenseMap<uint64_t, uint64_t>> StringIndexRemapOrErr =
-        buildRetainedStringIndexRemap(
-            LinkMap, CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false));
-    if (!StringIndexRemapOrErr)
-      return StringIndexRemapOrErr.takeError();
-    StringIndexRemaps[*DWOId] = *StringIndexRemapOrErr;
-
-    Expected<DenseMap<uint64_t, uint64_t>> DirectStringOffsetRemapOrErr =
-        buildRetainedDirectStringOffsetRemap(
-            LinkMap, CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false));
-    if (!DirectStringOffsetRemapOrErr)
-      return DirectStringOffsetRemapOrErr.takeError();
-    DirectStringOffsetRemaps[*DWOId] = *DirectStringOffsetRemapOrErr;
-
-    Expected<DenseMap<uint64_t, uint64_t>> LocationOffsetRemapOrErr =
-        buildRetainedLocationOffsetRemap(
-            LinkMap, CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false),
-            SectionContents.lookup(DW_SECT_EXT_LOC));
-    if (!LocationOffsetRemapOrErr)
-      return LocationOffsetRemapOrErr.takeError();
-    LocationOffsetRemaps[*DWOId] = *LocationOffsetRemapOrErr;
-
-    Expected<DenseMap<uint64_t, uint64_t>> RangeListOffsetRemapOrErr =
-        buildRetainedRangeListOffsetRemap(
-            LinkMap, CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false),
-            SectionContents.lookup(DW_SECT_RNGLISTS));
-    if (!RangeListOffsetRemapOrErr)
-      return RangeListOffsetRemapOrErr.takeError();
-    RangeListOffsetRemaps[*DWOId] = *RangeListOffsetRemapOrErr;
   }
 
   Expected<RetainedDWPStringSectionInfo> RewrittenStringSectionOrErr =
-      buildRetainedDWPStringSection(*DWPContext, LinkMap,
+      buildRetainedDWPStringSection(*DWPContext, Descriptors,
                                     SectionContents.lookup(DW_SECT_STR_OFFSETS),
-                                    DebugStrContents, StringIndexRemaps,
-                                    DirectStringOffsetRemaps);
+                                    DebugStrContents, UnitAnalyses);
   if (!RewrittenStringSectionOrErr)
     return RewrittenStringSectionOrErr.takeError();
-  StringOffsetRemaps = std::move(RewrittenStringSectionOrErr->StringOffsetRemapsByDWOId);
+  const DenseMap<uint64_t, DenseMap<uint64_t, uint64_t>> &StringOffsetRemaps =
+      RewrittenStringSectionOrErr->StringOffsetRemapsByDWOId;
 
-  for (const std::unique_ptr<DWARFUnit> &CU : DWPContext->dwo_compile_units()) {
-    std::optional<uint64_t> DWOId = CU->getDWOId();
-    if (!DWOId || !LinkMap.findLinkedUnit(*DWOId))
-      continue;
+  SmallVector<RetainedDWPRewriteUnitContents, 4> UnitContents(Plan.Units.size());
+  if (UseParallel) {
+    SmallVector<RetainedDWPRewriteUnitContents, 4> PackageOrderContents(
+        Descriptors.size());
+    if (Error Err = executeRetainedDWPUnitTasks(
+            ArrayRef<RetainedDWPRewriteUnitDescriptor>(Descriptors), Options,
+            MutableArrayRef<RetainedDWPRewriteUnitContents>(PackageOrderContents),
+            [&](size_t, const RetainedDWPRewriteUnitDescriptor &Descriptor)
+                -> Expected<RetainedDWPRewriteUnitContents> {
+              const RetainedDWPRewriteUnitAnalysis &Analysis =
+                  UnitAnalyses[Descriptor.SortedUnitIndex];
+              return rewriteRetainedDWPUnitTask(
+                  LinkMap, Options.DWPFileName, Descriptor, Analysis,
+                  StringOffsetRemaps.lookup(Descriptor.DWOId));
+            }))
+      return std::move(Err);
+    for (size_t I = 0; I != Descriptors.size(); ++I)
+      UnitContents[Descriptors[I].SortedUnitIndex] =
+          std::move(PackageOrderContents[I]);
+  } else {
+    for (const RetainedDWPRewriteUnitDescriptor &Descriptor : Descriptors) {
+      Expected<DWARFUnit *> CUOrErr =
+          getRetainedDWPCompileUnit(*DWPContext, Descriptor);
+      if (!CUOrErr)
+        return CUOrErr.takeError();
 
-    Expected<std::string> RewrittenUnitOrErr = rewriteRetainedDWPInfoUnit(
-        LinkMap, CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false),
-        SectionContents.lookup(DW_SECT_INFO), StringIndexRemaps[*DWOId],
-        LocationOffsetRemaps[*DWOId], StringOffsetRemaps.lookup(*DWOId),
-        RangeListOffsetRemaps[*DWOId]);
-    if (!RewrittenUnitOrErr)
-      return RewrittenUnitOrErr.takeError();
-    RewrittenInfoUnitContents[*DWOId] = std::move(*RewrittenUnitOrErr);
-
-    Expected<std::string> RewrittenAbbrevOrErr = rewriteRetainedDWPAbbrevUnit(
-        LinkMap, CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false),
-        SectionContents.lookup(DW_SECT_ABBREV));
-    if (!RewrittenAbbrevOrErr)
-      return RewrittenAbbrevOrErr.takeError();
-    RewrittenAbbrevUnitContents[*DWOId] = std::move(*RewrittenAbbrevOrErr);
-
-    Expected<std::string> RewrittenStrOffsetsOrErr =
-        rewriteRetainedDWPStringOffsetsUnit(
-            CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false),
-            SectionContents.lookup(DW_SECT_STR_OFFSETS), StringIndexRemaps[*DWOId],
-            StringOffsetRemaps.lookup(*DWOId));
-    if (!RewrittenStrOffsetsOrErr)
-      return RewrittenStrOffsetsOrErr.takeError();
-    RewrittenStringOffsetsUnitContents[*DWOId] =
-        std::move(*RewrittenStrOffsetsOrErr);
-
-    Expected<std::string> RewrittenLocOrErr = rewriteRetainedDWPLocUnit(
-        LinkMap, CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false),
-        SectionContents.lookup(DW_SECT_EXT_LOC), LocationOffsetRemaps[*DWOId]);
-    if (!RewrittenLocOrErr)
-      return RewrittenLocOrErr.takeError();
-    RewrittenLocUnitContents[*DWOId] = std::move(*RewrittenLocOrErr);
-
-    Expected<std::string> RewrittenRnglistsOrErr = rewriteRetainedDWPRnglistsUnit(
-        LinkMap, CU->getUnitDIE(/*ExtractUnitDIEOnly=*/false),
-        SectionContents.lookup(DW_SECT_RNGLISTS), RangeListOffsetRemaps[*DWOId]);
-    if (!RewrittenRnglistsOrErr)
-      return RewrittenRnglistsOrErr.takeError();
-    RewrittenRnglistsUnitContents[*DWOId] = std::move(*RewrittenRnglistsOrErr);
+      Expected<RetainedDWPRewriteUnitContents> ContentsOrErr =
+          rewriteRetainedDWPUnit(
+              LinkMap, (*CUOrErr)->getUnitDIE(/*ExtractUnitDIEOnly=*/false),
+              SectionContents, UnitAnalyses[Descriptor.SortedUnitIndex],
+              StringOffsetRemaps.lookup(Descriptor.DWOId));
+      if (!ContentsOrErr)
+        return ContentsOrErr.takeError();
+      UnitContents[Descriptor.SortedUnitIndex] = std::move(*ContentsOrErr);
+    }
   }
 
-  RetainedDWPRewritePlan Plan;
-  Plan.Units = *PackageUnitsOrErr;
+  DenseMap<uint64_t, size_t> RewriteUnitIndices;
+  for (size_t I = 0; I != UnitContents.size(); ++I)
+    RewriteUnitIndices.try_emplace(UnitContents[I].DWOId, I);
 
-  for (const RetainedDWPPackageUnitInfo &Unit : Plan.Units) {
+  for (size_t I = 0; I != Plan.Units.size(); ++I) {
+    const RetainedDWPPackageUnitInfo &Unit = Plan.Units[I];
+    const RetainedDWPRewriteUnitContents &RewrittenUnitContents = UnitContents[I];
     for (const PackageUnitInfo::SectionContributionInfo &Contribution :
          Unit.Contributions) {
       RetainedDWPSectionContributionInfo &Stored =
@@ -2234,13 +2561,9 @@ collectRetainedDWPRewritePlan(const DWPLinkMap &LinkMap, StringRef DWPFileName) 
       Stored.Offset = Contribution.Offset;
       Stored.InputLength = Contribution.Length;
       Stored.Length = Contribution.Length;
-      Expected<std::optional<StringRef>> RewrittenContentsOrErr =
-          getRewrittenUnitContents(Contribution.Kind, Unit.Unit.DWOId,
-                                   RewrittenUnitContentsByKind, "contents");
-      if (!RewrittenContentsOrErr)
-        return RewrittenContentsOrErr.takeError();
-      if (*RewrittenContentsOrErr)
-        Stored.Length = (*RewrittenContentsOrErr)->size();
+      if (std::optional<StringRef> RewrittenContents =
+              getRewrittenUnitContents(Contribution.Kind, RewrittenUnitContents))
+        Stored.Length = RewrittenContents->size();
     }
   }
 
@@ -2272,35 +2595,20 @@ collectRetainedDWPRewritePlan(const DWPLinkMap &LinkMap, StringRef DWPFileName) 
     SectionPlan.OutputSize = Plan.getTotalContributionLength(Kind);
     SectionPlan.Contributions = std::move(Contributions);
 
-    StringRef InputContents = SectionContents.lookup(Kind);
     SectionPlan.Contents.reserve(SectionPlan.OutputSize);
     for (const RetainedDWPSectionContributionInfo &Contribution :
          SectionPlan.Contributions) {
-      Expected<std::optional<StringRef>> RewrittenContentsOrErr =
-          getRewrittenUnitContents(Kind, Contribution.DWOId,
-                                   RewrittenUnitContentsByKind, "contribution");
-      if (!RewrittenContentsOrErr)
-        return RewrittenContentsOrErr.takeError();
-      if (*RewrittenContentsOrErr) {
-        if (Error Err = validateRewrittenUnitContentsSize(
-                Kind, Contribution.DWOId, Contribution.Length,
-                **RewrittenContentsOrErr))
-          return Err;
-        SectionPlan.Contents.append(**RewrittenContentsOrErr);
-        continue;
-      }
-
-      if (Contribution.Offset + Contribution.InputLength > InputContents.size())
-        return createStringError(
-            std::errc::invalid_argument,
-            formatv("unable to materialize retained contribution outside input "
-                    "section bounds: {0}",
-                    formatRetainedContribution(Contribution))
-                .str()
-                .c_str());
-      SectionPlan.Contents.append(
-          InputContents.slice(Contribution.Offset,
-                              Contribution.Offset + Contribution.InputLength));
+      auto It = RewriteUnitIndices.find(Contribution.DWOId);
+      assert(It != RewriteUnitIndices.end() &&
+             "missing rewritten unit contents");
+      std::optional<StringRef> RewrittenContents =
+          getRewrittenUnitContents(Kind, UnitContents[It->second]);
+      assert(RewrittenContents &&
+             "rewrite section plan expects rewritten contents for known kinds");
+      if (Error Err = validateRewrittenUnitContentsSize(
+              Kind, Contribution.DWOId, Contribution.Length, *RewrittenContents))
+        return Err;
+      SectionPlan.Contents.append(*RewrittenContents);
     }
 
     RetainedDWPOutputSection &OutputSection = Plan.OutputSections.emplace_back();
@@ -3183,7 +3491,7 @@ Expected<DWPLinkMap> loadDWPLinkMap(const object::ObjectFile &InputFile,
   LinkMap.rebuildLookupCaches();
 
   Expected<RetainedDWPRewritePlan> RewritePlanOrErr =
-      collectRetainedDWPRewritePlan(LinkMap, Options.DWPFileName);
+      collectRetainedDWPRewritePlan(LinkMap, Options);
   if (!RewritePlanOrErr)
     return RewritePlanOrErr.takeError();
   if (RewritePlanOrErr->Units.size() != LinkMap.RetainedPackageUnits.size())

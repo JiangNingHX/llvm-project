@@ -203,7 +203,7 @@ collectRetainedDWPUnits(const DWPLinkMap &LinkMap, StringRef DWPFileName);
 Expected<SmallVector<RetainedDWPPackageUnitInfo, 4>>
 collectRetainedDWPPackageUnits(const DWPLinkMap &LinkMap, StringRef DWPFileName);
 Expected<RetainedDWPRewritePlan>
-collectRetainedDWPRewritePlan(const DWPLinkMap &LinkMap, StringRef DWPFileName);
+collectRetainedDWPRewritePlan(const DWPLinkMap &LinkMap, const Options &Options);
 
 void logDWPLinkMap(const DWPLinkMap &LinkMap, const Options &Options);
 

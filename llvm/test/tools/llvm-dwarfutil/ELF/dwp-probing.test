@@ -11,12 +11,21 @@
 # RUN: llvm-dwarfutil --verbose --dwp %t.dwp %t1.o %t.proto.dwp 2>&1 | FileCheck %s --check-prefixes=CHECK,CONTAINER
 # RUN: llvm-dwarfutil --odr-deduplication --no-odr-deduplication --dwp %t.dwp %t1.o %t.override.dwp
 # RUN: cmp %t.proto.dwp %t.override.dwp
+# RUN: llvm-dwarfutil --num-threads 1 --dwp %t.dwp %t1.o %t.serial.dwp
+# RUN: llvm-dwarfutil --num-threads 2 --dwp %t.dwp %t1.o %t.parallel.dwp
+# RUN: cmp %t.serial.dwp %t.parallel.dwp
 # RUN: not llvm-dwarfutil --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-image --dwp %t.dwp %t1.o - 2>&1 | FileCheck %s --check-prefix=STDOUTERR
 # RUN: llvm-dwarfutil --verbose --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-image --dwp %t.dwp %t1.o %t.payload 2>&1 | FileCheck %s --check-prefix=IMAGE
 # RUN: test -s %t.payload
+# RUN: llvm-dwarfutil --num-threads 1 --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-image --dwp %t.dwp %t1.o %t.serial.payload
+# RUN: llvm-dwarfutil --num-threads 2 --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-image --dwp %t.dwp %t1.o %t.parallel.payload
+# RUN: cmp %t.serial.payload %t.parallel.payload
 # RUN: not llvm-dwarfutil --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-bundle --dwp %t.dwp %t1.o - 2>&1 | FileCheck %s --check-prefix=STDOUTERR
 # RUN: llvm-dwarfutil --verbose --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-bundle --dwp %t.dwp %t1.o %t.bundle 2>&1 | FileCheck %s --check-prefix=BUNDLE
 # RUN: test -s %t.bundle
+# RUN: llvm-dwarfutil --num-threads 1 --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-bundle --dwp %t.dwp %t1.o %t.serial.bundle
+# RUN: llvm-dwarfutil --num-threads 2 --no-garbage-collection --no-odr-deduplication --experimental-dwp-output-bundle --dwp %t.dwp %t1.o %t.parallel.bundle
+# RUN: cmp %t.serial.bundle %t.parallel.bundle
 # RUN: llvm-dwarfdump --debug-cu-index %t.proto.dwp | FileCheck %s --check-prefix=INDEX
 # RUN: llvm-dwarfdump --debug-info %t.proto.dwp | FileCheck %s --check-prefix=INFO
 # RUN: llvm-dwarfdump --debug-abbrev %t.proto.dwp | FileCheck %s --check-prefix=ABBREV

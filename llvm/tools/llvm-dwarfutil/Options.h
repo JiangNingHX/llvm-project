@@ -40,6 +40,7 @@ struct Options {
   TombstoneKind Tombstone = TombstoneKind::Universal;
   bool Verbose = false;
   int NumThreads = 0;
+  bool NumThreadsExplicit = false;
   bool Verify = false;
   bool UseDWARFLinkerParallel = false;
   DwarfUtilAccelKind AccelTableKind = DwarfUtilAccelKind::None;

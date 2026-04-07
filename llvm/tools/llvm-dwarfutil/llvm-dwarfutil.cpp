@@ -109,10 +109,13 @@ static Error validateAndSetOptions(opt::InputArgList &Args, Options &Options) {
   Options.ExperimentalDWPOutputBundle =
       Args.hasArg(OPT_experimental_dwp_output_bundle);
 
-  if (opt::Arg *NumThreads = Args.getLastArg(OPT_threads))
+  if (opt::Arg *NumThreads = Args.getLastArg(OPT_threads)) {
     Options.NumThreads = atoi(NumThreads->getValue());
-  else
+    Options.NumThreadsExplicit = true;
+  } else {
     Options.NumThreads = 0; // Use all available hardware threads
+    Options.NumThreadsExplicit = false;
+  }
 
   if (opt::Arg *Tombstone = Args.getLastArg(OPT_tombstone)) {
     StringRef S = Tombstone->getValue();
