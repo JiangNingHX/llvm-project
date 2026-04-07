@@ -66,6 +66,17 @@ static bool isCompanionMainUnit(DWARFUnit &Unit) {
   return Unit.getDWOId().has_value() && !getUnitDWOName(Unit).empty();
 }
 
+static DenseMap<uint64_t, SmallVector<DWARFUnit *, 1>>
+indexCompanionMainUnits(DWARFContext &Context) {
+  DenseMap<uint64_t, SmallVector<DWARFUnit *, 1>> UnitsByDWOId;
+  for (const std::unique_ptr<DWARFUnit> &CU : Context.compile_units()) {
+    if (!isCompanionMainUnit(*CU))
+      continue;
+    UnitsByDWOId[*CU->getDWOId()].push_back(CU.get());
+  }
+  return UnitsByDWOId;
+}
+
 static Expected<OwningBinary<Binary>> openBinary(StringRef FileName) {
   Expected<OwningBinary<Binary>> BinOrErr = createBinary(FileName);
   if (!BinOrErr)
@@ -92,6 +103,49 @@ static std::optional<StringRef> getDWPSectionName(DWARFSectionKind Kind) {
   default:
     return std::nullopt;
   }
+}
+
+static std::string getDWPSectionNameForError(DWARFSectionKind Kind) {
+  if (std::optional<StringRef> Name = getDWPSectionName(Kind))
+    return std::string(*Name);
+  return std::string(toString(Kind));
+}
+
+static Expected<std::optional<StringRef>> getRewrittenUnitContents(
+    DWARFSectionKind Kind, uint64_t DWOId,
+    const DenseMap<DWARFSectionKind, DenseMap<uint64_t, std::string> *>
+        &RewrittenUnitContentsByKind,
+    StringRef Context) {
+  auto MapIt = RewrittenUnitContentsByKind.find(Kind);
+  if (MapIt == RewrittenUnitContentsByKind.end())
+    return std::optional<StringRef>();
+
+  auto ContentsIt = MapIt->second->find(DWOId);
+  if (ContentsIt == MapIt->second->end())
+    return createStringError(
+        std::errc::invalid_argument,
+        formatv("missing rewritten {0} {1} for DWO_id {2:x16}",
+                getDWPSectionNameForError(Kind), Context, DWOId)
+            .str()
+            .c_str());
+  return std::optional<StringRef>(StringRef(ContentsIt->second));
+}
+
+static Error validateRewrittenUnitContentsSize(DWARFSectionKind Kind,
+                                               uint64_t DWOId,
+                                               uint64_t ExpectedSize,
+                                               StringRef Contents) {
+  if (Contents.size() == ExpectedSize)
+    return Error::success();
+
+  return createStringError(
+      std::errc::invalid_argument,
+      formatv("rewritten {0} size mismatch for DWO_id {1:x16}: expected "
+              "0x{2:x}, got 0x{3:x}",
+              getDWPSectionNameForError(Kind), DWOId, ExpectedSize,
+              Contents.size())
+          .str()
+          .c_str());
 }
 
 static bool shouldRewriteRetainedReferenceAttr(dwarf::Attribute Attr) {
@@ -1705,25 +1759,39 @@ findLiveSubprogram(const SkeletonUnitInfo &Info) {
   return nullptr;
 }
 
+static bool addRetainedDIEOffset(uint64_t Offset, SkeletonUnitInfo &Info,
+                                 DenseSet<uint64_t> &SeenOffsets,
+                                 SmallVectorImpl<uint64_t> *NewOffsets =
+                                     nullptr) {
+  if (!SeenOffsets.insert(Offset).second)
+    return false;
+  Info.RetainedDIEOffsets.push_back(Offset);
+  if (NewOffsets)
+    NewOffsets->push_back(Offset);
+  return true;
+}
+
 static void addRetainedDIEChain(const DWARFDie &Die, SkeletonUnitInfo &Info,
-                                DenseSet<uint64_t> &SeenOffsets) {
+                                DenseSet<uint64_t> &SeenOffsets,
+                                SmallVectorImpl<uint64_t> *NewOffsets =
+                                    nullptr) {
   for (DWARFDie Current = Die; Current; Current = Current.getParent()) {
     uint64_t Offset = getUnitRelativeDIEOffset(Current);
-    if (SeenOffsets.insert(Offset).second)
-      Info.RetainedDIEOffsets.push_back(Offset);
+    addRetainedDIEOffset(Offset, Info, SeenOffsets, NewOffsets);
   }
 }
 
 static void addRetainedDIESubtree(const DWARFDie &RootDie, SkeletonUnitInfo &Info,
-                                  DenseSet<uint64_t> &SeenOffsets) {
+                                  DenseSet<uint64_t> &SeenOffsets,
+                                  SmallVectorImpl<uint64_t> *NewOffsets =
+                                      nullptr) {
   SmallVector<DWARFDie, 8> Worklist;
   Worklist.push_back(RootDie);
 
   while (!Worklist.empty()) {
     DWARFDie Die = Worklist.pop_back_val();
     uint64_t Offset = getUnitRelativeDIEOffset(Die);
-    if (SeenOffsets.insert(Offset).second)
-      Info.RetainedDIEOffsets.push_back(Offset);
+    addRetainedDIEOffset(Offset, Info, SeenOffsets, NewOffsets);
 
     for (DWARFDie Child : reverse(Die.children()))
       Worklist.push_back(Child);
@@ -1768,32 +1836,26 @@ static void expandRetainedReferenceClosure(const DWARFDie &UnitDIE,
                                            SkeletonUnitInfo &Info) {
   DenseSet<uint64_t> SeenOffsets(Info.RetainedDIEOffsets.begin(),
                                  Info.RetainedDIEOffsets.end());
+  SmallVector<uint64_t, 16> Worklist(Info.RetainedDIEOffsets.begin(),
+                                     Info.RetainedDIEOffsets.end());
 
-  bool Changed = true;
-  while (Changed) {
-    Changed = false;
-    SmallVector<uint64_t, 16> Snapshot(Info.RetainedDIEOffsets.begin(),
-                                       Info.RetainedDIEOffsets.end());
-    for (uint64_t Offset : Snapshot) {
-      DWARFDie Die = getDIEForUnitRelativeOffset(UnitDIE, Offset);
-      if (!Die || Die.isNULL())
+  while (!Worklist.empty()) {
+    uint64_t Offset = Worklist.pop_back_val();
+    DWARFDie Die = getDIEForUnitRelativeOffset(UnitDIE, Offset);
+    if (!Die || Die.isNULL())
+      continue;
+
+    for (dwarf::Attribute Attr : {dwarf::DW_AT_type,
+                                  dwarf::DW_AT_specification,
+                                  dwarf::DW_AT_abstract_origin,
+                                  dwarf::DW_AT_object_pointer,
+                                  dwarf::DW_AT_containing_type}) {
+      DWARFDie ReferencedDie = Die.getAttributeValueAsReferencedDie(Attr);
+      if (!ReferencedDie)
         continue;
 
-      for (dwarf::Attribute Attr : {dwarf::DW_AT_type,
-                                    dwarf::DW_AT_specification,
-                                    dwarf::DW_AT_abstract_origin,
-                                    dwarf::DW_AT_object_pointer,
-                                    dwarf::DW_AT_containing_type}) {
-        DWARFDie ReferencedDie = Die.getAttributeValueAsReferencedDie(Attr);
-        if (!ReferencedDie)
-          continue;
-
-        size_t PrevSize = Info.RetainedDIEOffsets.size();
-        addRetainedDIEChain(ReferencedDie, Info, SeenOffsets);
-        addRetainedDIESubtree(ReferencedDie, Info, SeenOffsets);
-        if (Info.RetainedDIEOffsets.size() != PrevSize)
-          Changed = true;
-      }
+      addRetainedDIEChain(ReferencedDie, Info, SeenOffsets, &Worklist);
+      addRetainedDIESubtree(ReferencedDie, Info, SeenOffsets, &Worklist);
     }
   }
 }
@@ -2052,6 +2114,14 @@ collectRetainedDWPRewritePlan(const DWPLinkMap &LinkMap, StringRef DWPFileName) 
   DenseMap<uint64_t, std::string> RewrittenStringOffsetsUnitContents;
   DenseMap<uint64_t, std::string> RewrittenLocUnitContents;
   DenseMap<uint64_t, std::string> RewrittenRnglistsUnitContents;
+  DenseMap<DWARFSectionKind, DenseMap<uint64_t, std::string> *>
+      RewrittenUnitContentsByKind = {
+          {DW_SECT_INFO, &RewrittenInfoUnitContents},
+          {DW_SECT_ABBREV, &RewrittenAbbrevUnitContents},
+          {DW_SECT_STR_OFFSETS, &RewrittenStringOffsetsUnitContents},
+          {DW_SECT_EXT_LOC, &RewrittenLocUnitContents},
+          {DW_SECT_RNGLISTS, &RewrittenRnglistsUnitContents},
+      };
   DenseMap<uint64_t, DenseMap<uint64_t, uint64_t>> StringIndexRemaps;
   DenseMap<uint64_t, DenseMap<uint64_t, uint64_t>> DirectStringOffsetRemaps;
   DenseMap<uint64_t, DenseMap<uint64_t, uint64_t>> StringOffsetRemaps;
@@ -2164,62 +2234,13 @@ collectRetainedDWPRewritePlan(const DWPLinkMap &LinkMap, StringRef DWPFileName) 
       Stored.Offset = Contribution.Offset;
       Stored.InputLength = Contribution.Length;
       Stored.Length = Contribution.Length;
-      if (Contribution.Kind == DW_SECT_INFO) {
-        auto RewrittenIt = RewrittenInfoUnitContents.find(Unit.Unit.DWOId);
-        if (RewrittenIt == RewrittenInfoUnitContents.end())
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("missing rewritten .debug_info.dwo contents for DWO_id "
-                      "{0:x16}",
-                      Unit.Unit.DWOId)
-                  .str()
-                  .c_str());
-        Stored.Length = RewrittenIt->second.size();
-      } else if (Contribution.Kind == DW_SECT_ABBREV) {
-        auto RewrittenIt = RewrittenAbbrevUnitContents.find(Unit.Unit.DWOId);
-        if (RewrittenIt == RewrittenAbbrevUnitContents.end())
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("missing rewritten .debug_abbrev.dwo contents for DWO_id "
-                      "{0:x16}",
-                      Unit.Unit.DWOId)
-                  .str()
-                  .c_str());
-        Stored.Length = RewrittenIt->second.size();
-      } else if (Contribution.Kind == DW_SECT_STR_OFFSETS) {
-        auto RewrittenIt = RewrittenStringOffsetsUnitContents.find(Unit.Unit.DWOId);
-        if (RewrittenIt == RewrittenStringOffsetsUnitContents.end())
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("missing rewritten .debug_str_offsets.dwo contents for "
-                      "DWO_id {0:x16}",
-                      Unit.Unit.DWOId)
-                  .str()
-                  .c_str());
-        Stored.Length = RewrittenIt->second.size();
-      } else if (Contribution.Kind == DW_SECT_EXT_LOC) {
-        auto RewrittenIt = RewrittenLocUnitContents.find(Unit.Unit.DWOId);
-        if (RewrittenIt == RewrittenLocUnitContents.end())
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("missing rewritten .debug_loc.dwo contents for DWO_id "
-                      "{0:x16}",
-                      Unit.Unit.DWOId)
-                  .str()
-                  .c_str());
-        Stored.Length = RewrittenIt->second.size();
-      } else if (Contribution.Kind == DW_SECT_RNGLISTS) {
-        auto RewrittenIt = RewrittenRnglistsUnitContents.find(Unit.Unit.DWOId);
-        if (RewrittenIt == RewrittenRnglistsUnitContents.end())
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("missing rewritten .debug_rnglists.dwo contents for "
-                      "DWO_id {0:x16}",
-                      Unit.Unit.DWOId)
-                  .str()
-                  .c_str());
-        Stored.Length = RewrittenIt->second.size();
-      }
+      Expected<std::optional<StringRef>> RewrittenContentsOrErr =
+          getRewrittenUnitContents(Contribution.Kind, Unit.Unit.DWOId,
+                                   RewrittenUnitContentsByKind, "contents");
+      if (!RewrittenContentsOrErr)
+        return RewrittenContentsOrErr.takeError();
+      if (*RewrittenContentsOrErr)
+        Stored.Length = (*RewrittenContentsOrErr)->size();
     }
   }
 
@@ -2255,111 +2276,17 @@ collectRetainedDWPRewritePlan(const DWPLinkMap &LinkMap, StringRef DWPFileName) 
     SectionPlan.Contents.reserve(SectionPlan.OutputSize);
     for (const RetainedDWPSectionContributionInfo &Contribution :
          SectionPlan.Contributions) {
-      if (Kind == DW_SECT_INFO) {
-        auto RewrittenIt = RewrittenInfoUnitContents.find(Contribution.DWOId);
-        if (RewrittenIt == RewrittenInfoUnitContents.end())
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("missing rewritten .debug_info.dwo contribution for "
-                      "DWO_id {0:x16}",
-                      Contribution.DWOId)
-                  .str()
-                  .c_str());
-        if (RewrittenIt->second.size() != Contribution.Length)
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("rewritten .debug_info.dwo size mismatch for DWO_id "
-                      "{0:x16}: expected 0x{1:x}, got 0x{2:x}",
-                      Contribution.DWOId, Contribution.Length,
-                      RewrittenIt->second.size())
-                  .str()
-                  .c_str());
-        SectionPlan.Contents.append(RewrittenIt->second);
-        continue;
-      } else if (Kind == DW_SECT_ABBREV) {
-        auto RewrittenIt = RewrittenAbbrevUnitContents.find(Contribution.DWOId);
-        if (RewrittenIt == RewrittenAbbrevUnitContents.end())
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("missing rewritten .debug_abbrev.dwo contribution for "
-                      "DWO_id {0:x16}",
-                      Contribution.DWOId)
-                  .str()
-                  .c_str());
-        if (RewrittenIt->second.size() != Contribution.Length)
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("rewritten .debug_abbrev.dwo size mismatch for DWO_id "
-                      "{0:x16}: expected 0x{1:x}, got 0x{2:x}",
-                      Contribution.DWOId, Contribution.Length,
-                      RewrittenIt->second.size())
-                  .str()
-                  .c_str());
-        SectionPlan.Contents.append(RewrittenIt->second);
-        continue;
-      } else if (Kind == DW_SECT_STR_OFFSETS) {
-        auto RewrittenIt =
-            RewrittenStringOffsetsUnitContents.find(Contribution.DWOId);
-        if (RewrittenIt == RewrittenStringOffsetsUnitContents.end())
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("missing rewritten .debug_str_offsets.dwo contribution "
-                      "for DWO_id {0:x16}",
-                      Contribution.DWOId)
-                  .str()
-                  .c_str());
-        if (RewrittenIt->second.size() != Contribution.Length)
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("rewritten .debug_str_offsets.dwo size mismatch for "
-                      "DWO_id {0:x16}: expected 0x{1:x}, got 0x{2:x}",
-                      Contribution.DWOId, Contribution.Length,
-                      RewrittenIt->second.size())
-                  .str()
-                  .c_str());
-        SectionPlan.Contents.append(RewrittenIt->second);
-        continue;
-      } else if (Kind == DW_SECT_EXT_LOC) {
-        auto RewrittenIt = RewrittenLocUnitContents.find(Contribution.DWOId);
-        if (RewrittenIt == RewrittenLocUnitContents.end())
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("missing rewritten .debug_loc.dwo contribution for "
-                      "DWO_id {0:x16}",
-                      Contribution.DWOId)
-                  .str()
-                  .c_str());
-        if (RewrittenIt->second.size() != Contribution.Length)
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("rewritten .debug_loc.dwo size mismatch for DWO_id "
-                      "{0:x16}: expected 0x{1:x}, got 0x{2:x}",
-                      Contribution.DWOId, Contribution.Length,
-                      RewrittenIt->second.size())
-                  .str()
-                  .c_str());
-        SectionPlan.Contents.append(RewrittenIt->second);
-        continue;
-      } else if (Kind == DW_SECT_RNGLISTS) {
-        auto RewrittenIt = RewrittenRnglistsUnitContents.find(Contribution.DWOId);
-        if (RewrittenIt == RewrittenRnglistsUnitContents.end())
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("missing rewritten .debug_rnglists.dwo contribution for "
-                      "DWO_id {0:x16}",
-                      Contribution.DWOId)
-                  .str()
-                  .c_str());
-        if (RewrittenIt->second.size() != Contribution.Length)
-          return createStringError(
-              std::errc::invalid_argument,
-              formatv("rewritten .debug_rnglists.dwo size mismatch for DWO_id "
-                      "{0:x16}: expected 0x{1:x}, got 0x{2:x}",
-                      Contribution.DWOId, Contribution.Length,
-                      RewrittenIt->second.size())
-                  .str()
-                  .c_str());
-        SectionPlan.Contents.append(RewrittenIt->second);
+      Expected<std::optional<StringRef>> RewrittenContentsOrErr =
+          getRewrittenUnitContents(Kind, Contribution.DWOId,
+                                   RewrittenUnitContentsByKind, "contribution");
+      if (!RewrittenContentsOrErr)
+        return RewrittenContentsOrErr.takeError();
+      if (*RewrittenContentsOrErr) {
+        if (Error Err = validateRewrittenUnitContentsSize(
+                Kind, Contribution.DWOId, Contribution.Length,
+                **RewrittenContentsOrErr))
+          return Err;
+        SectionPlan.Contents.append(**RewrittenContentsOrErr);
         continue;
       }
 
@@ -3207,28 +3134,37 @@ Expected<DWPLinkMap> loadDWPLinkMap(const object::ObjectFile &InputFile,
   }
   LinkMap.rebuildLookupCaches();
 
+  DenseMap<uint64_t, SmallVector<DWARFUnit *, 1>> CompanionUnitsByDWOId =
+      indexCompanionMainUnits(*InputContext);
+  DenseMap<uint64_t, size_t> NextCompanionUnitIndexByDWOId;
   for (const SkeletonUnitInfo &Info : LinkMap.SkeletonUnits) {
-    Expected<OwningBinary<Binary>> MainBinOrErr = openBinary(Options.InputFileName);
-    if (!MainBinOrErr)
-      return MainBinOrErr.takeError();
+    auto It = CompanionUnitsByDWOId.find(Info.DWOId);
+    if (It == CompanionUnitsByDWOId.end())
+      return createStringError(
+          std::errc::invalid_argument,
+          formatv("unable to refind companion compile unit for DWO_id {0:x16}",
+                  Info.DWOId)
+              .str()
+              .c_str());
 
-    auto *MainObject = cast<ObjectFile>(MainBinOrErr->getBinary());
-    std::unique_ptr<DWARFContext> MainContext = DWARFContext::create(*MainObject);
-    for (const std::unique_ptr<DWARFUnit> &CU : MainContext->compile_units()) {
-      if (!isCompanionMainUnit(*CU) || CU->getDWOId() != Info.DWOId)
-        continue;
+    size_t &NextIndex = NextCompanionUnitIndexByDWOId[Info.DWOId];
+    if (NextIndex >= It->second.size())
+      return createStringError(
+          std::errc::invalid_argument,
+          formatv("companion compile unit index overflow for DWO_id {0:x16}",
+                  Info.DWOId)
+              .str()
+              .c_str());
 
-      DWARFDie SplitUnitDie =
-          CU->getNonSkeletonUnitDIE(/*ExtractUnitDIEOnly=*/false,
-                                    Options.DWPFileName);
-      if (!SplitUnitDie)
-        break;
-      if (Error Err = validateLiveSubprograms(LinkMap, SplitUnitDie))
-        return Err;
-      if (Error Err = validateRetainedDIEs(LinkMap, SplitUnitDie))
-        return Err;
-      break;
-    }
+    DWARFDie SplitUnitDie =
+        It->second[NextIndex++]->getNonSkeletonUnitDIE(
+            /*ExtractUnitDIEOnly=*/false, Options.DWPFileName);
+    if (!SplitUnitDie)
+      continue;
+    if (Error Err = validateLiveSubprograms(LinkMap, SplitUnitDie))
+      return Err;
+    if (Error Err = validateRetainedDIEs(LinkMap, SplitUnitDie))
+      return Err;
   }
 
   Expected<SmallVector<RetainedDWPPackageUnitInfo, 4>> RetainedUnitsOrErr =

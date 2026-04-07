@@ -1,3 +1,4 @@
+# REQUIRES: x86-registered-target
 ## This test checks verbose --dwp probing on split DWARF package inputs.
 
 # RUN: llc -split-dwarf-file=%t1.dwo -filetype=obj -o %t1.o < %p/Inputs/dwp-probing-a.ll
@@ -76,11 +77,11 @@
 # INDEX: units = 1
 
 # INFO: .debug_info.dwo contents:
-# INFO: Compile Unit: length = 0x00000033
+# INFO: Compile Unit: length = 0x{{[0-9a-f]+}}
 # INFO: DW_TAG_compile_unit
 # INFO: DW_TAG_subprogram
 # INFO: DW_TAG_formal_parameter
-# INFO: DW_AT_type (0x00000027)
+# INFO: DW_AT_type (0x{{[0-9a-f]+}} "int")
 # INFO: DW_TAG_base_type
 
 # ABBREV: .debug_abbrev.dwo contents:

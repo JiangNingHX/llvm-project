@@ -1,3 +1,4 @@
+# REQUIRES: x86-registered-target
 ## This test checks that --dwp keeps unit-local type references reachable only
 ## through retained declaration DIEs.
 

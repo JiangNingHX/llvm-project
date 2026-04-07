@@ -1,3 +1,4 @@
+# REQUIRES: x86-registered-target
 ## This test checks that --dwp accepts split units with no live subprogram roots.
 
 # RUN: llc -split-dwarf-file=%t.dwo -filetype=obj -o %t.o < %p/Inputs/dwp-empty-live-root.ll
