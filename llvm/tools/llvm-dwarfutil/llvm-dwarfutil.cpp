@@ -886,91 +886,6 @@ static Error validateDWPOutputContainerPrototype(
   return Error::success();
 }
 
-static Error validateDWPOutputContainerLinkage(const Options &Opts,
-                                               const DWPLinkMap &LinkMap) {
-  Expected<OwningBinary<Binary>> MainBinOrErr = createBinary(Opts.InputFileName);
-  if (!MainBinOrErr)
-    return createFileError(Opts.InputFileName, MainBinOrErr.takeError());
-  if (!MainBinOrErr->getBinary()->isObject())
-    return createFileError(Opts.InputFileName,
-                           createError("unsupported main input file"));
-
-  Options ValidationOpts = Opts;
-  ValidationOpts.DWPFileName = Opts.OutputFileName;
-  ValidationOpts.ExperimentalDWPOutputImage = false;
-  ValidationOpts.ExperimentalDWPOutputBundle = false;
-
-  const auto *MainObject = cast<ObjectFile>(MainBinOrErr->getBinary());
-  Expected<DWPLinkMap> RevalidatedLinkMapOrErr =
-      loadDWPLinkMap(*MainObject, ValidationOpts);
-  if (!RevalidatedLinkMapOrErr)
-    return RevalidatedLinkMapOrErr.takeError();
-
-  const DWPLinkMap &RevalidatedLinkMap = *RevalidatedLinkMapOrErr;
-  if (RevalidatedLinkMap.LinkedUnits.size() != LinkMap.LinkedUnits.size())
-    return createStringError(
-        std::errc::invalid_argument,
-        formatv("revalidated DWP linked unit count mismatch: expected {0}, "
-                "got {1}",
-                LinkMap.LinkedUnits.size(),
-                RevalidatedLinkMap.LinkedUnits.size())
-            .str()
-            .c_str());
-  if (RevalidatedLinkMap.RetainedPackageUnits.size() !=
-      LinkMap.RetainedPackageUnits.size())
-    return createStringError(
-        std::errc::invalid_argument,
-        formatv("revalidated retained DWP package unit count mismatch: "
-                "expected {0}, got {1}",
-                LinkMap.RetainedPackageUnits.size(),
-                RevalidatedLinkMap.RetainedPackageUnits.size())
-            .str()
-            .c_str());
-
-  for (const LinkedSplitUnit &ExpectedUnit : LinkMap.LinkedUnits) {
-    const LinkedSplitUnit *ActualUnit =
-        RevalidatedLinkMap.findLinkedUnit(ExpectedUnit.Skeleton.DWOId);
-    if (!ActualUnit)
-      return createStringError(
-          std::errc::invalid_argument,
-          formatv("revalidated DWP output is missing linked unit for DWO_id "
-                  "{0:x16}",
-                  ExpectedUnit.Skeleton.DWOId)
-              .str()
-              .c_str());
-    if (ActualUnit->Skeleton.getLiveSubprogramCount() !=
-        ExpectedUnit.Skeleton.getLiveSubprogramCount())
-      return createStringError(
-          std::errc::invalid_argument,
-          formatv("revalidated live subprogram count mismatch for DWO_id "
-                  "{0:x16}: expected {1}, got {2}",
-                  ExpectedUnit.Skeleton.DWOId,
-                  ExpectedUnit.Skeleton.getLiveSubprogramCount(),
-                  ActualUnit->Skeleton.getLiveSubprogramCount())
-              .str()
-              .c_str());
-    if (!ExpectedUnit.Skeleton.LiveRootOffsets.empty() &&
-        ActualUnit->Skeleton.LiveRootOffsets.empty())
-      return createStringError(
-          std::errc::invalid_argument,
-          formatv("revalidated DWP output has no live roots for DWO_id "
-                  "{0:x16}",
-                  ExpectedUnit.Skeleton.DWOId)
-              .str()
-              .c_str());
-    if (ActualUnit->Skeleton.RetainedDIEOffsets.empty())
-      return createStringError(
-          std::errc::invalid_argument,
-          formatv("revalidated DWP output has no retained DIEs for DWO_id "
-                  "{0:x16}",
-                  ExpectedUnit.Skeleton.DWOId)
-              .str()
-              .c_str());
-  }
-
-  return Error::success();
-}
-
 static Error saveDWPOutputContainerPrototype(const Options &Opts,
                                             const DWPLinkMap &LinkMap) {
   Expected<OwningBinary<Binary>> DWPBinOrErr = createBinary(Opts.DWPFileName);
@@ -1020,7 +935,7 @@ static Error saveDWPOutputContainerPrototype(const Options &Opts,
   if (Error Err = validateDWPOutputContainerPrototype(
           Opts.OutputFileName, LinkMap, *CUIndexContentsOrErr))
     return Err;
-  if (Error Err = validateDWPOutputContainerLinkage(Opts, LinkMap))
+  if (Error Err = validateRetainedDWPOutputContainerLinkage(Opts, LinkMap))
     return Err;
 
   verbose(formatv("Wrote retained DWP container prototype '{0}': sections={1}, "

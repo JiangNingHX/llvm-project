@@ -204,6 +204,8 @@ Expected<SmallVector<RetainedDWPPackageUnitInfo, 4>>
 collectRetainedDWPPackageUnits(const DWPLinkMap &LinkMap, StringRef DWPFileName);
 Expected<RetainedDWPRewritePlan>
 collectRetainedDWPRewritePlan(const DWPLinkMap &LinkMap, const Options &Options);
+Error validateRetainedDWPOutputContainerLinkage(const Options &Options,
+                                                const DWPLinkMap &LinkMap);
 
 void logDWPLinkMap(const DWPLinkMap &LinkMap, const Options &Options);
 
