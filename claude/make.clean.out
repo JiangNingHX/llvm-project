@@ -1,0 +1,5 @@
+rm -rf *.o  balancedneuron-2.sli.out cuba-4002-0.dat cuba-4003-0.dat cuba.sli.out cuba_ps-4002-0.dat cuba_ps-4003-0.dat cuba_ps.sli.out
+find . \( -name \*.o -o -name '*.fppized.f*' -o -name '*.i' -o -name '*.mod' \) -print | xargs rm -rf
+rm -rf nest_r
+rm -rf nest_r.exe
+rm -rf core
