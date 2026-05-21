@@ -562,8 +562,68 @@ static bool canDoSplitModule(const llvm::Module &M) {
 }
 
 static bool HasLargeCG(Module &Mod, const ModuleSummaryIndex &CombinedIndex) {
-  // TODO: Check whether there has large callgraphs. When multiple callgraphs
+  // Check whether there has large callgraphs. When multiple callgraphs
   // are split, thinlto parallel compilation can bring benefits.
+  llvm::CallGraph CG(Mod);
+  llvm::SimplifyCallGraph SCG(CG, CombinedIndex, Mod);
+  DenseSet<const Function *> visitedFuncs;
+  DenseMap<const Function *, uint64_t> EntryFuncs;
+
+  auto visitedSCG = [&](const Function *F) {
+    SmallVector<const Function *> WorkList;
+    DenseSet<const Function *> FindedFuncs;
+    WorkList.push_back(F);
+    while (!WorkList.empty()) {
+      const auto &CurFn = *WorkList.pop_back_val();
+      for (auto &SCGNode : *SCG.at(&CurFn)) {
+        auto *Callee = SCGNode->getFunction();
+        if (!Callee || Callee->isDeclaration())
+          continue;
+
+        auto [It, Inserted] = FindedFuncs.insert(Callee);
+        if (Inserted) {
+          WorkList.push_back(Callee);
+          EntryFuncs[F] += calFunctionSize(*Callee);
+          visitedFuncs.insert(Callee);
+        }
+      }
+    }
+  };
+
+  for (auto &NodePair : SCG) {
+    SimplifyCallGraphNode *SCGNode = NodePair.second.get();
+    Function *F = SCGNode->getFunction();
+    if (F && SCGNode->getNumReferences() == 0) {
+      EntryFuncs[F] = calFunctionSize(*F);
+      visitedFuncs.insert(F);
+    }
+  }
+
+  for (auto &Entry : EntryFuncs) {
+    visitedSCG(Entry.first);
+  }
+
+  for (auto &F : Mod) {
+    if (F.isDeclaration())
+      continue;
+    if (visitedFuncs.count(&F))
+      continue;
+    visitedFuncs.insert(&F);
+    EntryFuncs[&F] = calFunctionSize(F);
+    visitedSCG(&F);
+  }
+  uint64_t moduleSize = calModuleSize(Mod);
+
+  int OverThreshold = 0;
+  for (auto &SizePair : EntryFuncs) {
+    if (SizePair.second >= moduleSize * ThinLTOSplitModuleSizeRateThreshold) {
+      OverThreshold += 1;
+    }
+  }
+  if (OverThreshold == 1) {
+    return false;
+  }
+
   return true;
 }
 
