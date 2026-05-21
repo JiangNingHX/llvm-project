@@ -513,8 +513,84 @@ SplitModuleCG::SplitModuleCG(Module &M,
   N = N == 0 ? 1 : N;
 }
 
+void SimplifyCallGraph::traceIndirectCallUsage(
+    Value *V, Function *F, SimplifyCallGraphNode *SCGNode, int Depth) {
+  if (Depth > 5) {
+    return;
+  }
+  for (auto *User : V->users()) {
+    if (auto *I = dyn_cast<Instruction>(User)) {
+      Function *ParentFunc = I->getFunction();
+      if (ParentFunc && ParentFunc != F) {
+        getOrInsertFunction(ParentFunc)->addCalledFunction(SCGNode);
+      }
+    }
+    else if (auto *C = dyn_cast<Constant>(User)) {
+      if (auto *GV = dyn_cast<GlobalVariable>(C)) {
+        traceIndirectCallUsage(GV, F, SCGNode, Depth + 1);
+      } else {
+        traceIndirectCallUsage(C, F, SCGNode, Depth + 1);
+      }
+    }
+  }
+}
+
+Function *SimplifyCallGraph::resolveIndirectCalls(
+    Instruction *I, SimplifyCallGraphNode *SCGNode,
+    DenseMap<uint64_t, const Function *> &GUIDFuntionMap,
+    ICallPromotionAnalysis &ICallAnalysis) {
+  auto *CB = cast<CallBase>(I);
+  auto *CalledValue = CB->getCalledOperand();
+  auto *CalledFunction = CB->getCalledFunction();
+  if (CalledValue && !CalledFunction) {
+    CalledValue = CalledValue->stripPointerCasts();
+    // Stripping pointer casts can reveal a called function.
+    CalledFunction = dyn_cast<Function>(CalledValue);
+  }
+  // Check if this is an alias to a function.
+  if (auto *GA = dyn_cast<GlobalAlias>(CalledValue)) {
+    GlobalObject *GO = GA->getAliaseeObject();
+    CalledFunction = dyn_cast_or_null<Function>(GO);
+  }
+  if (!CalledFunction) {
+    const auto *CI = dyn_cast<CallInst>(I);
+    // Skip inline assembly calls.
+    if (CI && CI->isInlineAsm())
+      return nullptr;
+    // Skip direct calls.
+    if (!CalledValue || isa<Constant>(CalledValue))
+      return nullptr;
+    // Check if the instruction has a callees metadata.
+    if (auto *MD = I->getMetadata(LLVMContext::MD_callees)) {
+      for (const auto &Op : MD->operands()) {
+        Function *Callee = mdconst::extract_or_null<Function>(Op);
+        if (Callee && !Callee->isDeclaration())
+          SCGNode->addCalledFunction(getOrInsertFunction(Callee));
+      }
+    }
+  // Check if this is an indirect call with profile data.
+    uint32_t NumCandidates;
+    uint64_t TotalCount;
+    auto CandidateProfileData =
+        ICallAnalysis.getPromotionCandidatesForInstruction(
+              I, TotalCount, NumCandidates);
+    for (const auto &Candidate : CandidateProfileData) {
+      const Function *Callee = GUIDFuntionMap[Candidate.Value];
+      if (Callee && !Callee->isDeclaration())
+        SCGNode->addCalledFunction(getOrInsertFunction(Callee));
+    }
+  }
+  return CalledFunction;
+}
+
 void SimplifyCallGraph::createSimplifyCallGraph(
     const ModuleSummaryIndex &CombinedIndex) {
+  DenseMap<uint64_t, const Function *> GUIDFuntionMap;
+  for (auto &F : M.functions()) {
+    GUIDFuntionMap[F.getGUID()] = &F;
+  }
+  ICallPromotionAnalysis ICallAnalysis;
+
   for (auto &NodePair : CG) {
     CallGraphNode *CGNode = NodePair.second.get();
     Function *F = CGNode->getFunction();
@@ -523,15 +599,18 @@ void SimplifyCallGraph::createSimplifyCallGraph(
 
     SimplifyCallGraphNode *SCGNode = getOrInsertFunction(F);
 
-    //TODO: Trace indirect call usage for the current function.
+    // Trace indirect call usage for the current function.
+    if (F->hasAddressTaken()) {
+      traceIndirectCallUsage(F, F, SCGNode, 0);
+    }
 
     for (const auto &CGNodeItem : *CGNode) {
       Function *Called = CGNodeItem.second->getFunction();
       if (!Called) {
-        //TODO: Deal with indirect call. 
-        // 1. Check if the instruction has a callees metadata.
-        // 2. Check if this is an indirect call with profile data.
-        // 3. Check if this is an alias to a function.
+        // Deal with indirect call.
+        auto *I = cast<Instruction>(*CGNodeItem.first);
+        Called = resolveIndirectCalls(I, SCGNode, GUIDFuntionMap,
+                                      ICallAnalysis);
       }
       if (!Called || Called->isDeclaration())
         continue;

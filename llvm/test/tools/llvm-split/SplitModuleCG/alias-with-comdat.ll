@@ -7,22 +7,22 @@
 ; CHECK0-DAG: @abar = alias void (), ptr @bar
 ; CHECK0-DAG: define void @foo() comdat($group)
 ; CHECK0-DAG: define void @bar() comdat($group)
-; CHECK0-DAG: declare void @baz()
+; CHECK0-DAG: define void @baz()
 ; CHECK0-DAG: declare void @call_foo()
 ; CHECK0-DAG: declare void @call_abar()
 
-; CHECK1-DAG: declare void @foo()
-; CHECK1-DAG: declare void @bar()
-; CHECK1-DAG: define void @baz()
-; CHECK1-DAG: declare void @call_foo()
-; CHECK1-DAG: define void @call_abar()
+; CHECK1-DAG: define available_externally void @foo()
+; CHECK1-DAG: define available_externally void @bar()
+; CHECK1-DAG: declare void @baz()
+; CHECK1-DAG: define void @call_foo()
+; CHECK1-DAG: declare void @call_abar()
 ; CHECK1-DAG: declare void @abar()
 
 ; CHECK2-DAG: define available_externally void @foo()
 ; CHECK2-DAG: define available_externally void @bar()
 ; CHECK2-DAG: declare void @baz()
-; CHECK2-DAG: define void @call_foo()
-; CHECK2-DAG: declare void @call_abar()
+; CHECK2-DAG: declare void @call_foo()
+; CHECK2-DAG: define void @call_abar()
 ; CHECK2-DAG: declare void @abar()
 
 $group = comdat any
