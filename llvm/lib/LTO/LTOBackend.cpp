@@ -105,6 +105,71 @@ extern cl::opt<bool> NoPGOWarnMismatch;
 extern cl::opt<bool> ThinLTOSplit;
 }
 
+static std::mutex ForwardDiagMutex;
+
+struct ForwardingDiagHandler : public DiagnosticHandler { 
+  DiagnosticHandler *OrigHandler;
+
+  ForwardingDiagHandler(DiagnosticHandler *Orig) : OrigHandler(Orig) {}
+
+  bool isAnyRemarkEnabled() const override {
+    return OrigHandler ? OrigHandler->isAnyRemarkEnabled() : false; 
+  }
+
+  bool isPassedOptRemarkEnabled(StringRef PassName) const override {
+    return OrigHandler ? OrigHandler->isPassedOptRemarkEnabled(PassName) : false; 
+  }
+
+  bool isMissedOptRemarkEnabled(StringRef PassName) const override { 
+    return OrigHandler ? OrigHandler->isMissedOptRemarkEnabled(PassName) : false; 
+  }
+		   
+  bool isAnalysisRemarkEnabled(StringRef PassName) const override {
+    return OrigHandler ? OrigHandler->isAnalysisRemarkEnabled(PassName) : false; 
+  }
+
+  bool handleDiagnostics(const DiagnosticInfo &DI) override {
+    if (!OrigHandler) { 
+        return false; 
+    }
+    if (DI.getSeverity() == DS_Error) {
+        std::lock_guard<std::mutex> Lock(ForwardDiagMutex);
+        return OrigHandler->handleDiagnostics(DI);
+    }
+    
+    if (DI.getSeverity() != DS_Remark) {
+        return true; 
+    }
+
+    if (const auto *OptDiag = dyn_cast<DiagnosticInfoOptimizationBase>(&DI)) {
+        StringRef PassName = OptDiag->getPassName();
+        if (isa<OptimizationRemarkAnalysis>(&DI)) {
+            if (!OrigHandler->isAnalysisRemarkEnabled(PassName)) {
+                return true; 
+            }
+        } 
+        else if (isa<OptimizationRemark>(&DI)) {
+            if (!OrigHandler->isPassedOptRemarkEnabled(PassName)) {
+                return true;
+            }
+        } 
+        else if (isa<OptimizationRemarkMissed>(&DI)) {
+            if (!OrigHandler->isMissedOptRemarkEnabled(PassName)) {
+                return true;
+            }
+        }
+        else {
+            if (!OrigHandler->isAnalysisRemarkEnabled(PassName)) {
+                return true;
+            }
+        }
+    }
+  
+    std::lock_guard<std::mutex> Lock(ForwardDiagMutex);
+    return OrigHandler->handleDiagnostics(DI);
+  }
+};
+
 [[noreturn]] static void reportOpenError(StringRef Path, Twine Msg) {
   errs() << "failed to open " << Path << ": " << Msg << '\n';
   errs().flush();
@@ -726,6 +791,9 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C,
   unsigned ThreadCount = 0;
   const Target *T = &TM->getTarget();
 
+  DiagnosticHandler *OrigDiagHandler = const_cast<DiagnosticHandler*>(Mod.getContext().getDiagHandlerPtr());
+  bool OrigHotness = Mod.getContext().getDiagnosticsHotnessRequested();
+
   bool GlobalTimeTraceEnabled = llvm::timeTraceProfilerEnabled();
 
   static std::mutex PrintMutex;
@@ -738,6 +806,10 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C,
 
   const auto HandleModulePartition = [&](std::unique_ptr<Module> MPart,
                                          unsigned PartitionId) {
+    MPart->getContext().setDiagnosticHandler(
+        std::make_unique<ForwardingDiagHandler>(OrigDiagHandler));
+    MPart->getContext().setDiagnosticsHotnessRequested(OrigHotness);
+
     bool NeedLocalProfiler = GlobalTimeTraceEnabled && !llvm::timeTraceProfilerEnabled();
     if(NeedLocalProfiler) {
       llvm::timeTraceProfilerInitialize(0, "Thinlto-BackEnd");
