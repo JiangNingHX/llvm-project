@@ -216,10 +216,17 @@ private:
   DenseSet<const GlobalValue *> SpecialGV;
   DenseSet<const Function *> AliasedFuncs;
   DenseSet<const Function *> IfuncResolver;
+  DenseSet<const Function *> DirectInitArrayAnchors;
+  DenseSet<const Function *> InitArrayAnchors;
+  DenseSet<const GlobalValue *> InitArrayAnchorMembers;
   SmallVector<FunctionWithDependencies> FWDWorkList;
 
   void calculateFunctionCosts();
   void calculateComdatMembers();
+  void calculateInitArrayAnchors();
+  bool isDirectInitArrayAnchor(const Function *Fn) const;
+  bool isInitArrayAnchor(const Function *Fn) const;
+  bool isInitArrayAnchorMember(const GlobalValue *GV) const;
   void dealWithAlias();
   void dealWithIFunc();
   std::vector<DenseSet<const Function *>> doPartitioning();

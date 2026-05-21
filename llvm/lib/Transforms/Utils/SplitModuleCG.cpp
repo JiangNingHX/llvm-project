@@ -156,7 +156,13 @@ std::vector<DenseSet<const Function *>> SplitModuleCG::doPartitioning() {
     auto &FnsInPart = Partitions[PID];
     FnsInPart.insert(FWD.F);
     for (const Function *Dep : FWD.Dependencies) {
-      FnsInPart.insert(Dep);
+      if (PID != 0 && isInitArrayAnchor(Dep)) {
+        externalize(const_cast<Function *>(Dep));
+        if (!isDirectInitArrayAnchor(Dep))
+          FnsInPart.insert(Dep);
+      } else {
+        FnsInPart.insert(Dep);
+      }
     }
 
     // Update the balancing queue. we scan backwards because in the common case
@@ -176,9 +182,28 @@ std::vector<DenseSet<const Function *>> SplitModuleCG::doPartitioning() {
   doPartitioningForAliasIfunc(Partitions, BalancingQueue);
   sort(BalancingQueue, ComparePartitions);
 
+  // Anchor structor functions referenced from llvm.global_ctors/dtors to
+  // partition 0 so .init_array/.fini_array entries are emitted there.
+  for (const Function &Fn : M) {
+    if (!Fn.isDeclaration() && isInitArrayAnchor(&Fn))
+      Partitions[0].insert(&Fn);
+  }
+  for (auto &[QueuePID, Cost] : BalancingQueue) {
+    if (QueuePID != 0)
+      continue;
+    CostType NewCost = 0;
+    for (const Function *Fn : Partitions[0])
+      NewCost += FuncsCosts.lookup(Fn);
+    Cost = NewCost;
+    break;
+  }
+  sort(BalancingQueue, ComparePartitions);
+
   for (auto &CurFn : FWDWorkList) {
     // Normal "load-balancing", assign to partition with least pressure.
     auto [PID, CurCost] = BalancingQueue.back();
+    if (isInitArrayAnchor(CurFn.F))
+      PID = 0;
     AssignToPartition(PID, CurFn);
   }
 
@@ -270,6 +295,66 @@ void SplitModuleCG::calculateComdatMembers() {
   }
 }
 
+void SplitModuleCG::calculateInitArrayAnchors() {
+  auto AnchorFromAppending = [&](StringRef Name) {
+    auto *Appended = M.getGlobalVariable(Name);
+    if (!Appended || !Appended->hasInitializer())
+      return;
+
+    auto *Entries = dyn_cast<ConstantArray>(Appended->getInitializer());
+    if (!Entries)
+      return;
+
+    auto AddAnchorMember = [&](const GlobalValue *GV) {
+      InitArrayAnchorMembers.insert(GV);
+      if (const auto *Fn = dyn_cast<Function>(GV))
+        if (!Fn->isDeclaration())
+          InitArrayAnchors.insert(Fn);
+      if (const Comdat *C = GV->getComdat()) {
+        for (const GlobalValue *Member : ComdatMembers.lookup(C)) {
+          InitArrayAnchorMembers.insert(Member);
+          if (const auto *MemberFn = dyn_cast<Function>(Member))
+            if (!MemberFn->isDeclaration())
+              InitArrayAnchors.insert(MemberFn);
+        }
+      }
+    };
+
+    for (Value *Entry : Entries->operands()) {
+      auto *Struct = dyn_cast<ConstantStruct>(Entry);
+      if (!Struct || Struct->getNumOperands() < 2)
+        continue;
+
+      auto *Fn = dyn_cast<Function>(
+          Struct->getOperand(1)->stripPointerCastsAndAliases());
+      if (!Fn || Fn->isDeclaration())
+        continue;
+
+      DirectInitArrayAnchors.insert(Fn);
+      AddAnchorMember(Fn);
+      if (Struct->getNumOperands() >= 3)
+        if (auto *Key = dyn_cast<GlobalValue>(
+                Struct->getOperand(2)->stripPointerCastsAndAliases()))
+          AddAnchorMember(Key);
+    }
+  };
+
+  AnchorFromAppending("llvm.global_ctors");
+  AnchorFromAppending("llvm.global_dtors");
+}
+
+bool SplitModuleCG::isDirectInitArrayAnchor(const Function *Fn) const {
+  return Fn && DirectInitArrayAnchors.contains(Fn);
+}
+
+bool SplitModuleCG::isInitArrayAnchor(const Function *Fn) const {
+  return Fn && InitArrayAnchors.contains(Fn);
+}
+
+bool SplitModuleCG::isInitArrayAnchorMember(const GlobalValue *GV) const {
+  return GV && InitArrayAnchorMembers.contains(GV);
+}
+
 void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I,
                                   function_ref<bool(const GlobalValue *)> NeedsConservativeImport) {
   // collect symbols to rename
@@ -309,6 +394,10 @@ void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I,
 
   for (auto &func : MPart.functions()) {
     auto Fn = M.getFunction(func.getName());
+    if (Fn && isInitArrayAnchor(Fn) && I != 0 && !func.isDeclaration()) {
+      AvailableExternalizeFunc(func);
+      continue;
+    }
     // Ensure that the alias and aliasee are defined in the same partition, and
     // that the ifunc and its resolver are also defined in the same partition.
     if (externalFunction.count(Fn) &&
@@ -327,6 +416,14 @@ void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I,
     }
   }
 
+  // Handle InitArray anchors
+  for (auto &GV : MPart.globals()) {
+    auto *GVInM = M.getNamedGlobal(GV.getName());
+    if (GVInM && isInitArrayAnchorMember(GVInM) && I != 0 &&
+        !GV.isDeclaration()) {
+      AvailableExternalizeGV(GV);
+    }
+  }
   // if a function is available externally, we need to ensure its globals
   // (which have same comdat as the function) are too.
   for (auto &func : MPart.functions()) {
@@ -458,6 +555,13 @@ void SplitModuleCG::SplitModule(ModuleCreationCallback ModuleCallback,
     const auto *Var = dyn_cast<GlobalVariable>(GV);
     return Var && Var->hasLocalLinkage();
   };
+  // Non-function members of an init-array COMDAT need to be imported into
+  // every partition; dealWithMpart turns non-owner copies into imports.
+  const auto IsInitArrayAnchorNonFunctionMember = [&](const GlobalValue *GV) {
+    if (const auto *Var = dyn_cast<GlobalVariable>(GV))
+      return isInitArrayAnchorMember(M.getGlobalVariable(Var->getName()));
+    return false;
+  };
 
   auto ShouldCloneDefinition = [&](unsigned I, const GlobalValue *GV) {
     const auto &FnsInPart = Partitions[I];
@@ -465,8 +569,12 @@ void SplitModuleCG::SplitModule(ModuleCreationCallback ModuleCallback,
     // Functions go in their assigned partition.
     if (const auto *newFn = dyn_cast<Function>(GV)) {
       const auto *Fn = M.getFunction(newFn->getName());
-      return FnsInPart.contains(Fn);
+      if (isDirectInitArrayAnchor(Fn))
+        return I == 0;
+      return FnsInPart.contains(Fn) || isInitArrayAnchor(Fn);
     }
+    if (IsInitArrayAnchorNonFunctionMember(GV))
+      return true;
     // GlobalVariable go in their assigned partition.
     if (const auto *newGV = dyn_cast<GlobalVariable>(GV)) {
       const auto *GVinM = M.getGlobalVariable(newGV->getName());
@@ -535,8 +643,7 @@ SplitModuleCG::SplitModuleCG(Module &M,
   // Construct a simplified call graph to facilitate worklist generation.
   SCG = std::make_unique<SimplifyCallGraph>(CG, CombinedIndex, M);
   calculateComdatMembers();
-  // TODO: When the SCG is established, the special cases of
-  // initarray need to be considered.
+  calculateInitArrayAnchors();
 
   // Populate the worklist with root functions and their transitive
   // dependencies. This worklist serves as the foundation for the
