@@ -425,7 +425,8 @@ void SplitModuleCG::SplitModule(ModuleCreationCallback ModuleCallback,
       externalFunction[&F] = true;
   }
   for (GlobalVariable &GV : M.globals())
-    externalize(&GV);
+    if (!GV.hasAttribute("thinlto-internalize"))
+      externalize(&GV);
   for (GlobalAlias &GA : M.aliases())
     externalize(&GA);
   for (GlobalIFunc &GI : M.ifuncs())
