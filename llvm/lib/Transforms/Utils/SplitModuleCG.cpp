@@ -53,6 +53,68 @@ doGValuePartitioning(
 }
 } // namespace
 
+void SplitModuleCG::doPartitioningForAliasIfunc(
+    std::vector<DenseSet<const Function *>> &Partitions,
+    std::vector<std::pair<unsigned, CostType>> &BalancingQueue) {
+  auto addDependence = [&](const Function * Func,
+                           DenseSet<const Function *> &GValueFuncs) {
+    Partitions[0].insert(Func);
+    GValueFuncs.insert(Func);
+    SmallVector<const Function *> WorkListForCallee({Func});
+    // Add the dependencies of the Callee to the work list.
+    if (Func->hasComdat() && ComdatMembers.count(Func->getComdat())) {
+      for (const GlobalValue *ComdateGV : ComdatMembers[Func->getComdat()]) {
+        if (const auto *ComdatFunc = llvm::dyn_cast<Function>(ComdateGV)) {
+          Partitions[0].insert(ComdatFunc);
+          GValueFuncs.insert(ComdatFunc);
+          WorkListForCallee.push_back(ComdatFunc);
+        }
+      }
+    }
+    DenseSet<const Function *> Dependencies;
+    while (!WorkListForCallee.empty()) {
+      const auto &CurFn = *WorkListForCallee.pop_back_val();
+      for (auto &SCGNode : *SCG->at(&CurFn)) {
+        auto *Callee = SCGNode->getFunction();
+        if (Callee == Func)
+          continue;
+        auto [It, Inserted] = Dependencies.insert(Callee);
+        if (Inserted && Callee->hasLocalLinkage() && !Callee->isDeclaration()) {
+          WorkListForCallee.push_back(Callee);
+          Partitions[0].insert(Callee);
+          GValueFuncs.insert(Callee);
+        }
+      }
+    }
+  };
+  // 1. Force aliases/ifunc and their callee into the first partition.
+  // 2. Ensure comdat groups containing aliasees/ifunc remain atomic.
+  for (auto &GA : M.aliases()) {
+    GlobalObject *GO = GA.getAliaseeObject();
+    if (!GO) continue;
+    if (const auto *Func = dyn_cast<Function>(GO)) {
+      addDependence(Func, AliasedFuncs);
+    }
+  }
+
+  for (auto &GI : M.ifuncs()) {
+    GlobalObject *GO = GI.getResolverFunction();
+    if (!GO) continue;
+    if (const auto *Func = dyn_cast<Function>(GO)) {
+      addDependence(Func, IfuncResolver);
+    }
+  }
+
+  for (auto &[QueuePID, Cost] : BalancingQueue) {
+    if (QueuePID == 0) {
+      CostType NewCost = 0;
+      for (const Function *Fn : Partitions[0])
+        NewCost += FuncsCosts.at(Fn);
+      Cost = NewCost;
+    }
+  }
+}
+
 std::vector<DenseSet<const Function *>> SplitModuleCG::doPartitioning() {
   LLVM_DEBUG(dbgs() << "\n--Partitioning Starts--\n");
   // Performs all of the partitioning work on M.
@@ -99,6 +161,9 @@ std::vector<DenseSet<const Function *>> SplitModuleCG::doPartitioning() {
     sort(BalancingQueue, ComparePartitions);
   };
 
+  doPartitioningForAliasIfunc(Partitions, BalancingQueue);
+  sort(BalancingQueue, ComparePartitions);
+
   for (auto &CurFn : FWDWorkList) {
     // Normal "load-balancing", assign to partition with least pressure.
     auto [PID, CurCost] = BalancingQueue.back();
@@ -123,6 +188,36 @@ void SplitModuleCG::calculateFunctionCosts() {
     FuncsCosts[&Fn] = FnCost;
     assert((ModuleCost + FnCost) >= ModuleCost && "Overflow!");
     ModuleCost += FnCost;
+  }
+}
+
+// Refer to OptimizeGlobalAliases's handling method
+void SplitModuleCG::dealWithAlias() {
+  // Return whether GV is explicitly or implicitly dso_local and not replaceable
+  // by another definition in the current linkage unit.
+  auto IsModuleLocal = [](GlobalValue &GV) {
+    return !GlobalValue::isInterposableLinkage(GV.getLinkage()) &&
+           (GV.isDSOLocal() || GV.isImplicitDSOLocal());
+  };
+
+  for (GlobalAlias &GA : llvm::make_early_inc_range(M.aliases())) {
+    if (!GA.hasName() && !GA.isDeclaration() && !GA.hasLocalLinkage())
+      GA.setLinkage(GlobalValue::InternalLinkage);
+    if (GA.use_empty())
+      continue;
+
+    // If the alias can change at link time, nothing can be done.
+    if (!IsModuleLocal(GA))
+      continue;
+    Constant *Aliasee = GA.getAliasee();
+    GlobalValue *Target = dyn_cast<GlobalValue>(Aliasee->stripPointerCasts());
+    if (!Target || !IsModuleLocal(*Target))
+      continue;
+
+    Constant *Replacement = (Aliasee->getType() == GA.getType())
+                            ? Aliasee
+                            : ConstantExpr::getBitCast(Aliasee, GA.getType());
+    GA.replaceNonMetadataUsesWith(Replacement);
   }
 }
 
@@ -202,6 +297,15 @@ void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I,
 
   for (auto &func : MPart.functions()) {
     auto Fn = M.getFunction(func.getName());
+    // Ensure that the alias and aliasee are defined in the same partition, and
+    // that the ifunc and its resolver are also defined in the same partition.
+    if (externalFunction.count(Fn) &&
+        (AliasedFuncs.contains(Fn) || IfuncResolver.contains(Fn))) {
+      if (I != 0 && !func.isDeclaration()) {
+        AvailableExternalizeFunc(func);
+        continue;
+      }
+    }
     if (externalFunction.count(Fn) && !func.isDeclaration()) {
       if (!externalFunction[Fn]) {
         AvailableExternalizeFunc(func);
@@ -303,8 +407,9 @@ void SplitModuleCG::SplitModule(ModuleCreationCallback ModuleCallback,
   for (GlobalIFunc &GI : M.ifuncs())
     externalize(&GI);
 
-  // TODO: Consider optimizing the alias, replacing the determined alias with
+  // Consider optimizing the alias, replacing the determined alias with
   // the determined aliasee.
+  dealWithAlias();
 
   // Assign callgraphs into N partitions.
   auto Partitions = doPartitioning();

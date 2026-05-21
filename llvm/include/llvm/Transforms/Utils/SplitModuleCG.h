@@ -202,14 +202,21 @@ private:
   DenseMap<const Function *, CostType> FuncsCosts;
   DenseMap<const Comdat *, DenseSet<const GlobalValue *>> ComdatMembers;
   DenseSet<const GlobalValue *> SpecialGV;
+  DenseSet<const Function *> AliasedFuncs;
+  DenseSet<const Function *> IfuncResolver;
   SmallVector<FunctionWithDependencies> FWDWorkList;
 
   void calculateFunctionCosts();
   void calculateComdatMembers();
+  void dealWithAlias();
+  void dealWithIFunc();
   std::vector<DenseSet<const Function *>> doPartitioning();
   void dealWithMpart(
       Module &MPart, unsigned I,
       function_ref<bool(const GlobalValue *)> NeedsConservativeImport);
+  void doPartitioningForAliasIfunc(
+      std::vector<DenseSet<const Function *>> &Partitions,
+      std::vector<std::pair<unsigned, CostType>> &BalancingQueue);
   void createWorkList();
 };
 
