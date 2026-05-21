@@ -78,10 +78,14 @@ public:
       Instruction *I, SimplifyCallGraphNode *SCGNode,
       DenseMap<uint64_t, const Function *> &GUIDFuntionMap,
       ICallPromotionAnalysis &ICallAnalysis);
+  DenseMap<const Function *, DenseSet<const GlobalVariable *>> &getVTableRecord() {
+    return VTableRecord;
+  }
 
 private:
   CallGraph &CG;
   Module &M;
+  DenseMap<const Function *, DenseSet<const GlobalVariable *>> VTableRecord;
 };
 
 class SimplifyCallGraphNode {
@@ -205,6 +209,7 @@ private:
   StringSet<> OriginalExternals;
   StringMap<std::string> PromotedRenames;
   DenseMap<const Function *, bool> externalFunction;
+  DenseMap<const GlobalValue *, bool> ExternalGValues;
   DenseMap<const Function *, DenseSet<const GlobalVariable *>> GVRecord;
   DenseMap<const Function *, CostType> FuncsCosts;
   DenseMap<const Comdat *, DenseSet<const GlobalValue *>> ComdatMembers;

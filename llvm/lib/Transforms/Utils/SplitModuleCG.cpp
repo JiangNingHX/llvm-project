@@ -51,6 +51,18 @@ doGValuePartitioning(
   }
   return GValuePartitions;
 }
+
+static bool isVTable(const GlobalVariable *GV) {
+  if (!GV) return false;
+  if (GV->getMetadata(llvm::LLVMContext::MD_type))
+    return true;
+
+  llvm::StringRef Name = GV->getName();
+  if (Name.starts_with("_ZTV"))
+    return true;
+
+  return false;
+}
 } // namespace
 
 void SplitModuleCG::doPartitioningForAliasIfunc(
@@ -326,6 +338,18 @@ void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I,
       AvailableExternalizeGV(*GV);
     }
   }
+  // Ensure that the global variable is external in one partition and available
+  // external in other partitions. This can avoid duplicate conflicts.
+  for (auto &GV : MPart.globals()) {
+    auto GVinM = M.getGlobalVariable(GV.getName());
+    if (ExternalGValues.count(GVinM) && !GV.isDeclaration()) {
+      if (!ExternalGValues[GVinM]) {
+        AvailableExternalizeGV(GV);
+      } else {
+        ExternalGValues[GVinM] = false;
+      }
+    }
+  }
 
   LLVM_DEBUG(dbgs() << MPart.getModuleIdentifier() << "  : \n");
   for (auto &F : MPart) {
@@ -415,6 +439,14 @@ void SplitModuleCG::SplitModule(ModuleCreationCallback ModuleCallback,
   auto Partitions = doPartitioning();
   assert(Partitions.size() == N);
   // Assign GlobalVariables into N partitions according to Partitions.
+  auto &VTableRecord = SCG->getVTableRecord();
+  auto GTVPartitions = doGValuePartitioning(VTableRecord, Partitions, N);
+  for (auto GVs : GTVPartitions) {
+    for (const auto *GV : GVs) {
+      if (!GV->isDeclaration() && GV->hasExternalLinkage())
+        ExternalGValues[GV] = true;
+    }
+  }
   auto GVPartitions = doGValuePartitioning(GVRecord, Partitions, N);
 
   // local GVs need to be conservatively imported into [dependency] every module,
@@ -437,6 +469,9 @@ void SplitModuleCG::SplitModule(ModuleCreationCallback ModuleCallback,
     // GlobalVariable go in their assigned partition.
     if (const auto *newGV = dyn_cast<GlobalVariable>(GV)) {
       const auto *GVinM = M.getGlobalVariable(newGV->getName());
+      // VTable go in their assigned partition.
+      if (GTVPartitions[I].contains(GVinM))
+        return true;
       // GlobalVariable with comdat go in their assigned partition.
       if (SpecialGV.count(GVinM))
         return GVPartitions[I].contains(GVinM);
@@ -527,6 +562,8 @@ void SimplifyCallGraph::traceIndirectCallUsage(
     }
     else if (auto *C = dyn_cast<Constant>(User)) {
       if (auto *GV = dyn_cast<GlobalVariable>(C)) {
+        if (isVTable(GV) || GV->hasAvailableExternallyLinkage())
+          VTableRecord[F].insert(GV);
         traceIndirectCallUsage(GV, F, SCGNode, Depth + 1);
       } else {
         traceIndirectCallUsage(C, F, SCGNode, Depth + 1);
