@@ -61,6 +61,7 @@
 #include "llvm/TargetParser/RISCVISAInfo.h"
 #include "llvm/TargetParser/RISCVTargetParser.h"
 #include <cctype>
+#include <optional>
 
 using namespace clang::driver;
 using namespace clang::driver::tools;
@@ -5395,6 +5396,22 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     if (!types::isLLVMIR(Input.getType()))
       D.Diag(diag::err_drv_arg_requires_bitcode_input) << A->getAsString(Args);
     Args.AddLastArg(CmdArgs, options::OPT_fthinlto_index_EQ);
+
+    std::optional<bool> ThinLTOSplitEnabled;
+    for (const Arg *A : Args.filtered(options::OPT_mllvm)) {
+      for (size_t I = 0, E = A->getNumValues(); I < E; ++I) {
+        StringRef Val = A->getValue(I);
+        if (Val == "-thinlto-split" || Val == "-thinlto-split=true")
+          ThinLTOSplitEnabled = true;
+        else if (Val == "-thinlto-split=false")
+          ThinLTOSplitEnabled = false;
+      }
+    }
+    if (ThinLTOSplitEnabled.value_or(false) && Output.isFilename() &&
+        Output.getType() == types::TY_Object && Triple.isOSBinFormatELF())
+      CmdArgs.push_back(Args.MakeArgString(
+          Twine("-thinlto-split-output-list=") + Output.getFilename() +
+          ".thinlto-split.rsp"));
   }
 
   if (Triple.isPPC())

@@ -93,6 +93,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 using namespace clang;
 using namespace llvm;
@@ -1329,11 +1330,45 @@ runThinLTOBackend(CompilerInstance &CI, ModuleSummaryIndex *CombinedIndex,
   if (!lto::initImportList(*M, *CombinedIndex, ImportList))
     return;
 
-  auto AddStream = [&](size_t Task, const Twine &ModuleName) {
+  const std::string &SplitOutputList =
+      CI.getFrontendOpts().ThinLTOSplitOutputList;
+  SmallVector<std::string, 4> SplitOutputFiles;
+  std::mutex SplitOutputFilesMutex;
+
+  auto AddStream = [&](size_t /*Task*/, const Twine &/*ModuleName*/)
+      -> Expected<std::unique_ptr<CachedFileStream>> {
+    if (!SplitOutputList.empty()) {
+      std::unique_ptr<raw_pwrite_stream> OutputOS;
+      std::string OutputPath;
+      {
+        std::lock_guard<std::mutex> Lock(SplitOutputFilesMutex);
+        unsigned OutputIndex = SplitOutputFiles.size();
+        if (OutputIndex == 0) {
+          OutputPath = CI.getFrontendOpts().OutputFile;
+          OutputOS = std::move(OS);
+        } else {
+          OutputPath = (Twine(CI.getFrontendOpts().OutputFile) +
+                        ".thinlto-split." + Twine(OutputIndex) + ".o")
+                           .str();
+        }
+        SplitOutputFiles.push_back(OutputPath);
+      }
+
+      if (!OutputOS) {
+        std::error_code EC;
+        OutputOS =
+            std::make_unique<raw_fd_ostream>(OutputPath, EC, sys::fs::OF_None);
+        if (EC)
+          return errorCodeToError(EC);
+      }
+      return std::make_unique<CachedFileStream>(std::move(OutputOS),
+                                                OutputPath);
+    }
     return std::make_unique<CachedFileStream>(std::move(OS),
                                               CGOpts.ObjectFilenameForDebug);
   };
   lto::Config Conf;
+  Conf.AcceptsMultipleOutputsPerTask = true;
   if (CGOpts.SaveTempsFilePrefix != "") {
     if (Error E = Conf.addSaveTemps(CGOpts.SaveTempsFilePrefix + ".",
                                     /* UseInputModulePath */ false)) {
@@ -1423,6 +1458,20 @@ runThinLTOBackend(CompilerInstance &CI, ModuleSummaryIndex *CombinedIndex,
       errs() << "Error running ThinLTO backend: " << EIB.message() << '\n';
     });
   }
+
+  if (!SplitOutputList.empty()) {
+    std::error_code EC;
+    raw_fd_ostream OutputListOS(SplitOutputList, EC, sys::fs::OF_Text);
+    if (EC) {
+      Diags.Report(diag::err_fe_unable_to_open_output)
+          << SplitOutputList << EC.message();
+      return;
+    }
+    for (StringRef OutputFile : SplitOutputFiles) {
+      sys::printArg(OutputListOS, OutputFile, /*Quote=*/true);
+      OutputListOS << '\n';
+    }
+  }
 }
 
 void clang::emitBackendOutput(CompilerInstance &CI, CodeGenOptions &CGOpts,
@@ -1476,6 +1525,20 @@ void clang::emitBackendOutput(CompilerInstance &CI, CodeGenOptions &CGOpts,
 
   EmitAssemblyHelper AsmHelper(CI, CGOpts, M, VFS);
   AsmHelper.emitAssembly(Action, std::move(OS), BC);
+
+  if (!CI.getFrontendOpts().ThinLTOSplitOutputList.empty()) {
+    std::error_code EC;
+    raw_fd_ostream OutputListOS(CI.getFrontendOpts().ThinLTOSplitOutputList, EC,
+                                sys::fs::OF_Text);
+    if (EC) {
+      Diags.Report(diag::err_fe_unable_to_open_output)
+          << CI.getFrontendOpts().ThinLTOSplitOutputList << EC.message();
+      return;
+    }
+    sys::printArg(OutputListOS, CI.getFrontendOpts().OutputFile,
+                  /*Quote=*/true);
+    OutputListOS << '\n';
+  }
 
   // Verify clang's TargetInfo DataLayout against the LLVM TargetMachine's
   // DataLayout.

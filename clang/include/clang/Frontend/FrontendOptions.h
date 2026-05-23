@@ -445,6 +445,9 @@ public:
   /// The output file, if any.
   std::string OutputFile;
 
+  /// Response file listing objects emitted by ThinLTO split codegen.
+  std::string ThinLTOSplitOutputList;
+
   /// If given, the new suffix for fix-it rewritten files.
   std::string FixItSuffix;
 

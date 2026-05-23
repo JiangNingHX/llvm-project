@@ -280,6 +280,39 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   const auto &ToolChain = static_cast<const Generic_ELF &>(getToolChain());
   const Driver &D = ToolChain.getDriver();
 
+  if (isa<ThinLTOMergeJobAction>(JA)) {
+    ArgStringList CmdArgs;
+    const char *BaseInput = nullptr;
+    for (const auto &II : Inputs) {
+      if (II.isFilename()) {
+        BaseInput = II.getFilename();
+        break;
+      }
+    }
+    assert(BaseInput && "ThinLTO merge job requires an input file");
+
+    const char *ResponseFile = Args.MakeArgString(
+        Twine(BaseInput) + ".thinlto-split.rsp");
+    C.addTempFile(ResponseFile);
+
+    CmdArgs.push_back("-r");
+    CmdArgs.push_back("-o");
+    CmdArgs.push_back(Output.getFilename());
+    CmdArgs.push_back(Args.MakeArgString(Twine("@") + ResponseFile));
+
+    std::string LLDPath = ToolChain.GetProgramPath("ld.lld");
+    if (!llvm::sys::fs::exists(LLDPath)) {
+      D.Diag(clang::diag::err_drv_lto_split_requires_lld) << LLDPath;
+      return;
+    }
+    const char *Exec = Args.MakeArgString(LLDPath);
+
+    C.addCommand(std::make_unique<Command>(JA, *this,
+                                           ResponseFileSupport::AtFileCurCP(),
+                                           Exec, CmdArgs, Inputs, Output));
+    return;
+  }
+
   const llvm::Triple &Triple = getToolChain().getEffectiveTriple();
 
   const llvm::Triple::ArchType Arch = ToolChain.getArch();

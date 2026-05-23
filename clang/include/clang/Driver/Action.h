@@ -77,9 +77,10 @@ public:
     BinaryAnalyzeJobClass,
     BinaryTranslatorJobClass,
     ObjcopyJobClass,
+    ThinLTOMergeJobClass,
 
     JobClassFirst = PreprocessJobClass,
-    JobClassLast = ObjcopyJobClass
+    JobClassLast = ThinLTOMergeJobClass
   };
 
   // The offloading kind determines if this action is binded to a particular
@@ -516,6 +517,17 @@ public:
 
   static bool classof(const Action *A) {
     return A->getKind() == LinkJobClass;
+  }
+};
+
+class ThinLTOMergeJobAction : public JobAction {
+  void anchor() override;
+
+public:
+  ThinLTOMergeJobAction(ActionList &Inputs, types::ID Type);
+
+  static bool classof(const Action *A) {
+    return A->getKind() == ThinLTOMergeJobClass;
   }
 };
 

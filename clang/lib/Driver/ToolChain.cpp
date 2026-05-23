@@ -770,6 +770,7 @@ Tool *ToolChain::getTool(Action::ActionClass AC) const {
   case Action::BinaryAnalyzeJobClass:
   case Action::BinaryTranslatorJobClass:
   case Action::ObjcopyJobClass:
+  case Action::ThinLTOMergeJobClass:
     llvm_unreachable("Invalid tool kind.");
 
   case Action::CompileJobClass:
@@ -1206,6 +1207,8 @@ Tool *ToolChain::SelectTool(const JobAction &JA) const {
   if (AC == Action::AssembleJobClass && useIntegratedAs() &&
       !getTriple().isOSAIX())
     return getClangAs();
+  if (AC == Action::ThinLTOMergeJobClass)
+    return getLink();
   return getTool(AC);
 }
 

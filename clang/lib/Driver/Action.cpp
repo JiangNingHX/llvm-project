@@ -54,6 +54,8 @@ const char *Action::getClassName(ActionClass AC) {
     return "binary-translator";
   case ObjcopyJobClass:
     return "objcopy";
+  case ThinLTOMergeJobClass:
+    return "thinlto-merger";
   }
 
   llvm_unreachable("invalid class");
@@ -401,6 +403,11 @@ void LinkJobAction::anchor() {}
 
 LinkJobAction::LinkJobAction(ActionList &Inputs, types::ID Type)
     : JobAction(LinkJobClass, Inputs, Type) {}
+
+void ThinLTOMergeJobAction::anchor() {}
+
+ThinLTOMergeJobAction::ThinLTOMergeJobAction(ActionList &Inputs, types::ID Type)
+    : JobAction(ThinLTOMergeJobClass, Inputs, Type) {}
 
 void LipoJobAction::anchor() {}
 

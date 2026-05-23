@@ -181,6 +181,8 @@ def warn_openmp_spec_incomplete : Warning<
   InGroup<ExperimentalOption>;
 def err_drv_invalid_thread_model_for_target : Error<
   "invalid thread model '%0' in '%1' for this target">;
+def err_drv_lto_split_requires_lld : Error<
+  "cannot find 'ld.lld' required for ThinLTO split codegen at '%0'">;
 def err_drv_invalid_linker_name : Error<
   "invalid linker name in argument '%0'">;
 def err_drv_invalid_rtlib_name : Error<

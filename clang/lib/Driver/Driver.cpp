@@ -4490,6 +4490,20 @@ shouldBundleHIPAsmWithNewDriver(const Compilation &C,
   return HasAMDGCNHIPDevice;
 }
 
+static bool isThinLTOSplitEnabled(const llvm::opt::ArgList &Args) {
+  std::optional<bool> Enabled;
+  for (const llvm::opt::Arg *A : Args.filtered(options::OPT_mllvm)) {
+    for (size_t i = 0, e = A->getNumValues(); i < e; ++i) {
+      StringRef Val = A->getValue(i);
+      if (Val == "-thinlto-split=true" || Val == "-thinlto-split")
+        Enabled = true;
+      else if (Val == "-thinlto-split=false")
+        Enabled = false;
+    }
+  }
+  return Enabled.value_or(false);
+}
+
 void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
                           const InputList &Inputs, ActionList &Actions) const {
   llvm::PrettyStackTraceString CrashInfo("Building compilation actions");
@@ -4623,8 +4637,18 @@ void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
     }
 
     // If we ended with something, add to the output list.
-    if (Current)
+    if (Current) {
+      if (Current->getType() == types::TY_Object &&
+          Args.hasArg(options::OPT_fthinlto_index_EQ) &&
+          Args.hasArg(options::OPT_c) &&
+          C.getDefaultToolChain().getTriple().isOSBinFormatELF() &&
+          isThinLTOSplitEnabled(Args)) {
+        ActionList Inputs;
+        Inputs.push_back(Current);
+        Current = C.MakeAction<ThinLTOMergeJobAction>(Inputs, types::TY_Object);
+      }
       Actions.push_back(Current);
+    }
 
     // Add any top level actions generated for offloading.
     if (!UseNewOffloadingDriver)

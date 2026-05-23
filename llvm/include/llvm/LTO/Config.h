@@ -105,6 +105,12 @@ struct Config {
   /// distinguished.
   mutable bool Dtlto = 0;
 
+  /// If this flag is set, the LTO client explicitly supports receiving multiple
+  /// concurrent AddStream calls for a single task when doing ThinLTO split
+  /// codegen. If false, attempting to emit multiple objects for a single task
+  /// will trigger a fatal error.
+  bool AcceptsMultipleOutputsPerTask = false;
+
   /// Allows non-imported definitions to get the potentially more constraining
   /// visibility from the prevailing definition. FromPrevailing is the default
   /// because it works for many binary formats. ELF can use the more optimized

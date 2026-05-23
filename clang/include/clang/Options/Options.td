@@ -3406,6 +3406,9 @@ def flto_jobs_EQ : Joined<["-"], "flto-jobs=">,
 def fthinlto_index_EQ : Joined<["-"], "fthinlto-index=">,
   Visibility<[ClangOption, CLOption, CC1Option]>, Group<f_Group>,
   HelpText<"Perform ThinLTO importing using provided function summary index">;
+def thinlto_split_output_list_EQ : Joined<["-"], "thinlto-split-output-list=">,
+  Visibility<[CC1Option]>, Flags<[HelpHidden]>,
+  MarshallingInfoString<FrontendOpts<"ThinLTOSplitOutputList">>;
 def fthin_link_bitcode_EQ : Joined<["-"], "fthin-link-bitcode=">,
   Visibility<[ClangOption, CLOption, CC1Option]>, Group<f_Group>,
   HelpText<"Write minimized bitcode to <file> for the ThinLTO thin link only">,
