@@ -29,6 +29,8 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+
 using namespace llvm;
 using namespace llvm::SDPatternMatch;
 
@@ -1254,6 +1256,26 @@ static bool isWorthFoldingADDlow(SDValue N) {
   return true;
 }
 
+static bool isELFTLSLocalExecLo12(const GlobalAddressSDNode *GAN) {
+  return GAN->getTargetFlags() ==
+         (AArch64II::MO_TLS | AArch64II::MO_PAGEOFF | AArch64II::MO_NC);
+}
+
+static bool canFoldELFTLSLocalExecOffset(const GlobalAddressSDNode *GAN,
+                                         int64_t Offset, unsigned Size,
+                                         const DataLayout &DL) {
+  if (Size > 8 || Offset < 0 || (Offset & (Size - 1)) != 0)
+    return false;
+
+  Align Alignment = GAN->getGlobal()->getPointerAlignment(DL);
+  uint64_t MaxFoldOffset = std::min<uint64_t>(Alignment.value(), 4096);
+
+  // The high relocation uses TPREL(S), while the load/store uses TPREL(S+C).
+  // TPREL(S) preserves the symbol alignment, so C below both that alignment
+  // and 4096 cannot carry into the high relocation.
+  return Alignment >= Size && static_cast<uint64_t>(Offset) < MaxFoldOffset;
+}
+
 /// Check if the immediate offset is valid as a scaled immediate.
 static bool isValidAsScaledImmediate(int64_t Offset, unsigned Range,
                                      unsigned Size) {
@@ -1349,14 +1371,32 @@ bool AArch64DAGToDAGISel::SelectAddrModeIndexed(SDValue N, unsigned Size,
     if (!GAN)
       return true;
 
-    if (GAN->getOffset() % Size == 0 &&
-        GAN->getGlobal()->getPointerAlignment(DL) >= Size)
+    bool IsELFTLSLo12 = Subtarget->isTargetELF() && isELFTLSLocalExecLo12(GAN);
+    if ((IsELFTLSLo12 &&
+         canFoldELFTLSLocalExecOffset(GAN, GAN->getOffset(), Size, DL)) ||
+        (!IsELFTLSLo12 && GAN->getOffset() % Size == 0 &&
+         GAN->getGlobal()->getPointerAlignment(DL) >= Size))
       return true;
   }
 
   if (CurDAG->isBaseWithConstantOffset(N)) {
     if (ConstantSDNode *RHS = dyn_cast<ConstantSDNode>(N.getOperand(1))) {
-      int64_t RHSC = (int64_t)RHS->getZExtValue();
+      int64_t RHSC = RHS->getSExtValue();
+      SDValue Addr = N.getOperand(0);
+
+      if (Subtarget->isTargetELF() && Addr.getOpcode() == AArch64ISD::ADDlow) {
+        SDValue Lo = Addr.getOperand(1);
+        auto *GAN = dyn_cast<GlobalAddressSDNode>(Lo);
+        if (GAN && isELFTLSLocalExecLo12(GAN) && GAN->getOffset() == 0 &&
+            canFoldELFTLSLocalExecOffset(GAN, RHSC, Size, DL)) {
+          Base = Addr.getOperand(0);
+          OffImm = CurDAG->getTargetGlobalAddress(GAN->getGlobal(), SDLoc(Lo),
+                                                  Lo.getValueType(), RHSC,
+                                                  GAN->getTargetFlags());
+          return true;
+        }
+      }
+
       unsigned Scale = Log2_32(Size);
       if (isValidAsScaledImmediate(RHSC, 0x1000, Size)) {
         Base = N.getOperand(0);

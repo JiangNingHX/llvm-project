@@ -67,6 +67,9 @@
 // 9. Replace UBFMXri with UBFMWri if the instruction is equivalent to a 32 bit
 //    LSR or LSL alias of UBFM.
 //
+// 10. Fold a local-exec TLS low add into scalar load/store relocations when the
+//     TLS symbol alignment proves that the added field offset cannot carry.
+//
 //===----------------------------------------------------------------------===//
 
 #include "AArch64ExpandImm.h"
@@ -143,6 +146,7 @@ private:
   bool visitFMOVDr(MachineInstr &MI);
   bool visitUBFMXri(MachineInstr &MI);
   bool visitCopy(MachineInstr &MI);
+  bool visitADDlowTLS(MachineInstr &MI);
 };
 
 struct AArch64MIPeepholeOptLegacy : public MachineFunctionPass {
@@ -370,6 +374,68 @@ bool AArch64MIPeepholeOptImpl::visitCSEL(MachineInstr &MI) {
       .addReg(MI.getOperand(1).getReg())
       .addImm(0);
 
+  MI.eraseFromParent();
+  return true;
+}
+
+bool AArch64MIPeepholeOptImpl::visitADDlowTLS(MachineInstr &MI) {
+  MachineOperand &Low = MI.getOperand(2);
+  if (!Low.isGlobal() || Low.getOffset() != 0 ||
+      Low.getTargetFlags() !=
+          (AArch64II::MO_TLS | AArch64II::MO_PAGEOFF | AArch64II::MO_NC))
+    return false;
+
+  Align Alignment =
+      Low.getGlobal()->getPointerAlignment(MI.getMF()->getDataLayout());
+  uint64_t MaxFoldOffset = Alignment.value();
+  if (MaxFoldOffset > 4096)
+    MaxFoldOffset = 4096;
+
+  Register DstReg = MI.getOperand(0).getReg();
+  SmallVector<std::pair<MachineInstr *, uint64_t>, 4> FoldableUses;
+  for (MachineInstr &UseMI : MRI->use_nodbg_instructions(DstReg)) {
+    if (UseMI.getNumExplicitOperands() != 3 || !UseMI.getOperand(1).isReg() ||
+        UseMI.getOperand(1).getReg() != DstReg ||
+        UseMI.getOperand(1).getSubReg() || !UseMI.getOperand(2).isImm())
+      return false;
+
+    for (unsigned I = 0, E = UseMI.getNumOperands(); I != E; ++I) {
+      const MachineOperand &MO = UseMI.getOperand(I);
+      if (I != 1 && MO.isReg() && MO.isUse() && MO.getReg() == DstReg)
+        return false;
+    }
+
+    TypeSize Scale = TypeSize::getFixed(0);
+    TypeSize Width = TypeSize::getFixed(0);
+    int64_t MinOffset, MaxOffset;
+    if (!AArch64InstrInfo::getMemOpInfo(UseMI.getOpcode(), Scale, Width,
+                                        MinOffset, MaxOffset) ||
+        Scale.isScalable() || Width.isScalable() || MinOffset != 0 ||
+        MaxOffset != 4095 || Scale != Width || Scale.getFixedValue() > 8 ||
+        Alignment < Scale.getFixedValue())
+      return false;
+
+    int64_t ScaledOffset = UseMI.getOperand(2).getImm();
+    if (ScaledOffset < 0)
+      return false;
+    uint64_t ByteOffset =
+        static_cast<uint64_t>(ScaledOffset) * Scale.getFixedValue();
+    if (ByteOffset >= MaxFoldOffset)
+      return false;
+    FoldableUses.emplace_back(&UseMI, ByteOffset);
+  }
+
+  if (FoldableUses.empty())
+    return false;
+
+  for (auto [UseMI, ByteOffset] : FoldableUses)
+    UseMI->getOperand(2).ChangeToGA(Low.getGlobal(), ByteOffset,
+                                    Low.getTargetFlags());
+
+  Register SrcReg = MI.getOperand(1).getReg();
+  MRI->markUsesInDebugValueAsUndef(DstReg);
+  MRI->replaceRegWith(DstReg, SrcReg);
+  MRI->clearKillFlags(SrcReg);
   MI.eraseFromParent();
   return true;
 }
@@ -1053,6 +1119,9 @@ bool AArch64MIPeepholeOptImpl::run(MachineFunction &MF) {
         break;
       case AArch64::COPY:
         Changed |= visitCopy(MI);
+        break;
+      case AArch64::ADDlowTLS:
+        Changed |= visitADDlowTLS(MI);
         break;
       }
     }
